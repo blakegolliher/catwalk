@@ -48,17 +48,27 @@ async def _lifespan(app: FastAPI):
     _state["backend"] = None
     _state["backend_error"] = None
     report_listening(cfg.host, cfg.port)
+    listings = warmer = None
     try:
         backend = make_backend(cfg)
-        _state["backend"] = backend
-        _state["listings"] = ListingService(backend, cfg, query_gate=_state["query_gate"])
-        _state["rollups"] = RollupService(backend, cfg, query_gate=_state["query_gate"])
-        warmer = CacheWarmer(_state["listings"], cfg)
-        _state["warmer"] = warmer
+        listings = ListingService(backend, cfg, query_gate=_state["query_gate"])
+        rollups = RollupService(backend, cfg, query_gate=_state["query_gate"])
+        warmer = CacheWarmer(listings, cfg)
         warmer.start()
+        # Publish only after every service is up: a backend stored earlier
+        # would satisfy the None-guards in _listings()/_rollups() while the
+        # services are missing, turning the intended 503 into a KeyError.
+        _state["backend"] = backend
+        _state["listings"] = listings
+        _state["rollups"] = rollups
+        _state["warmer"] = warmer
     except Exception as e:
         # Start anyway so /api/health can explain what is wrong.
         _state["backend_error"] = str(e)
+        if warmer is not None:
+            warmer.stop()
+        if listings is not None:
+            listings.close()
     yield
     jobs = _state.get("jobs")
     if jobs is not None:

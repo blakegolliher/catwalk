@@ -164,6 +164,26 @@ def test_prefetch_warms_child_listings():
     svc.close()
 
 
+def test_hung_prefetch_does_not_block_interactive_listing(monkeypatch):
+    import time
+    from concurrent.futures import Future
+
+    monkeypatch.setattr("catwalk.catalog._PREFETCH_JOIN_TIMEOUT_S", 0.05)
+    b = CountingBackend()
+    svc = make_service(b, prefetch_children=4)
+    hung = Future()
+    hung.set_running_or_notify_cancel()  # "running": join cannot cancel it
+    svc._prefetch_futures["/projects/proj-03/"] = hung
+    start = time.monotonic()
+    page = svc.list_page("/projects/proj-03", page=1)
+    assert time.monotonic() - start < 5, "join must give up on a hung prefetch"
+    assert page["total_rows"] > 0
+    # The timed-out join fell through to a direct query and cached it.
+    # (No call-count assertion: this listing's own child prefetches add calls.)
+    assert svc.cache.get(("/projects/proj-03/", "", "")) is not None
+    svc.close()
+
+
 def test_prefetch_disabled_when_zero():
     b = CountingBackend()
     svc = make_service(b, prefetch_children=0)

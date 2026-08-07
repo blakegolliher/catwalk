@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 
 import pyarrow as pa
@@ -60,6 +61,14 @@ SORT_KEYS = {"name", "size", "mtime", "atime", "owner_name"}
 SNAPSHOT_HINT = "Catalog data is snapshot-based (typically ≤30 min behind the live filesystem)"
 
 _MAX_SORT_VARIANTS = 3
+
+# How long an interactive request will wait for an in-flight prefetch of the
+# same directory before giving up and querying itself. Generous versus the
+# 2-8s typical listing, but bounded: a prefetch hung on a dead VIP must not
+# pin a user request for minutes (a fresh query may reach a healthy VIP).
+_PREFETCH_JOIN_TIMEOUT_S = 15.0
+
+log = logging.getLogger("catwalk.catalog")
 
 
 class RollupTooWide(RuntimeError):
@@ -442,8 +451,17 @@ class ListingService:
                         self._prefetch_futures.pop(path, None)
                 else:
                     # On prefetch failure, fall through to a normal query.
-                    with contextlib.suppress(Exception):
-                        fut.result(timeout=120)
+                    try:
+                        fut.result(timeout=_PREFETCH_JOIN_TIMEOUT_S)
+                    except FutureTimeoutError:
+                        log.warning(
+                            "prefetch of %s still running after %.0fs; "
+                            "querying it directly instead of waiting",
+                            path,
+                            _PREFETCH_JOIN_TIMEOUT_S,
+                        )
+                    except Exception:
+                        pass
 
         def compute():
             # A filtered listing is a subset of the unfiltered one: derive it
