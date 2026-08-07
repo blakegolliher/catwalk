@@ -21,6 +21,7 @@ let forwardStreak = 0;
 const rollups = new Map();     // path -> {children: {name -> stats}, totals}
 let rollupToken = 0;           // guards against stale poll renders
 let activeRollupJobId = null;
+let activeRollupCancelToken = null;
 const treeNodes = new Map();   // path -> {li, childrenUl, expanded}
 let treeRoot = "/";
 
@@ -334,9 +335,11 @@ function renderRollup(result) {
 async function loadRollup(path) {
   const token = ++rollupToken;
   if (activeRollupJobId) {
-    api("/api/rollup/status", { job_id: activeRollupJobId },
+    api("/api/rollup/status",
+        { job_id: activeRollupJobId, cancel_token: activeRollupCancelToken },
         { method: "DELETE" }).catch(() => {});
     activeRollupJobId = null;
+    activeRollupCancelToken = null;
   }
   $("rollup-totals").textContent = "";
   $("rollup-children").textContent = "";
@@ -359,7 +362,8 @@ async function loadRollup(path) {
   }
   if (token !== rollupToken) {
     if (r.status === 202 && r.body.job_id) {
-      api("/api/rollup/status", { job_id: r.body.job_id },
+      api("/api/rollup/status",
+          { job_id: r.body.job_id, cancel_token: r.body.cancel_token },
           { method: "DELETE" }).catch(() => {});
     }
     return;
@@ -369,6 +373,7 @@ async function loadRollup(path) {
   // 202: poll the job until done.
   const jobId = r.body.job_id;
   activeRollupJobId = jobId;
+  activeRollupCancelToken = r.body.cancel_token;
   const poll = async () => {
     if (token !== rollupToken) return;
     let s;
@@ -381,12 +386,18 @@ async function loadRollup(path) {
     }
     if (token !== rollupToken) return;
     if (s.body.status === "done") {
-      if (activeRollupJobId === jobId) activeRollupJobId = null;
+      if (activeRollupJobId === jobId) {
+        activeRollupJobId = null;
+        activeRollupCancelToken = null;
+      }
       renderRollup(s.body.result);
       return;
     }
     if (s.body.status === "error" || s.body.status === "cancelled") {
-      if (activeRollupJobId === jobId) activeRollupJobId = null;
+      if (activeRollupJobId === jobId) {
+        activeRollupJobId = null;
+        activeRollupCancelToken = null;
+      }
       $("rollup-status").textContent = `rollup failed: ${s.body.error}`;
       return;
     }

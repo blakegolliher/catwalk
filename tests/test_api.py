@@ -77,6 +77,13 @@ def test_rollup_status_unknown_job(client):
     assert client.get("/api/rollup/status", params={"job_id": "nope"}).status_code == 404
 
 
+def test_rollup_cancel_requires_token(client):
+    # Shared jobs may have other watchers; an anonymous cancel is refused.
+    assert client.delete("/api/rollup/status", params={"job_id": "nope"}).status_code == 422
+    r = client.delete("/api/rollup/status", params={"job_id": "nope", "cancel_token": "t"})
+    assert r.status_code == 404
+
+
 def test_export_listing_csv(client):
     r = client.get("/api/export/listing", params={"path": "/home/erin/notes"})
     assert r.status_code == 200

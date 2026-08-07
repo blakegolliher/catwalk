@@ -148,7 +148,9 @@ def aggregate_reader(reader, prefix, depth, groups, rows_cb=None, max_groups=0):
             .group_by("key")
             .aggregate(
                 [
-                    ("size", "count"),
+                    # mode="all": FILE rows with a null size are still files;
+                    # the default only_valid count would drop them.
+                    ("size", "count", pc.CountOptions(mode="all")),
                     ("size", "sum"),
                     ("used", "sum"),
                     ("mtime", "max"),

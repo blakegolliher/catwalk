@@ -147,7 +147,9 @@ enforced by the server anyway.
   cached. Empty child directories are seeded from a `DIR` listing so they
   still appear. Work is bounded and cancellable: the queue rejects excess
   scans, grouping stops at `CATWALK_ROLLUP_MAX_GROUPS`, and browser navigation
-  cancels obsolete asynchronous jobs.
+  cancels obsolete asynchronous jobs. Identical concurrent rollups share one
+  job; each `202` carries a per-client `cancel_token`, and the shared scan is
+  only cancelled once every client has detached with its token.
 
 ## Performance notes (measured against a 6-VIP lab, ~840M-row catalog)
 
@@ -203,9 +205,9 @@ catalog snapshot; if a new snapshot lands between the two runs, re-run).
 |---|---|
 | `GET /api/views` | Views from VMS (60s cache); `vms_unavailable: true` when VMS is absent |
 | `GET /api/ls?path=&page=&page_size=&sort=&order=&type=&name_filter=` | Paged directory listing |
-| `GET /api/rollup?path=&depth=&child_limit=` | Descendant rollup; `200` inline or `202 {job_id}`; child results are size-ranked and bounded |
+| `GET /api/rollup?path=&depth=&child_limit=` | Descendant rollup; `200` inline or `202 {job_id, cancel_token}`; child results are size-ranked and bounded |
 | `GET /api/rollup/status?job_id=` | Job progress (rows scanned) and final result |
-| `DELETE /api/rollup/status?job_id=` | Cancel a queued or running rollup |
+| `DELETE /api/rollup/status?job_id=&cancel_token=` | Detach from a shared rollup job; cancels the scan when the last client detaches |
 | `GET /api/capacity?path=` | VMS sampled capacity estimate (best-effort) |
 | `GET /api/export/listing`, `GET /api/export/rollup` | CSV downloads |
 | `GET /api/health` | vastdb / VMS / catalog reachability |

@@ -179,7 +179,7 @@ async def api_rollup(
 
     jobs: JobManager = _state["jobs"]
     try:
-        job = jobs.submit(
+        job, cancel_token = jobs.submit(
             ("rollup", prefix, depth), lambda cb: rollups.compute(prefix, depth, rows_cb=cb)
         )
     except JobQueueFull as e:
@@ -192,7 +192,12 @@ async def api_rollup(
     status_url = f"/api/rollup/status?job_id={job.id}"
     if child_limit is not None:
         status_url += f"&child_limit={child_limit}"
-    return JSONResponse(status_code=202, content={**job.snapshot(), "status_url": status_url})
+    # cancel_token is per-client even when the job itself is shared, so it
+    # goes in the 202 body only — never in shared status snapshots.
+    return JSONResponse(
+        status_code=202,
+        content={**job.snapshot(), "status_url": status_url, "cancel_token": cancel_token},
+    )
 
 
 @app.get("/api/rollup/status")
@@ -210,10 +215,12 @@ async def api_rollup_status(job_id: str, child_limit: int | None = Query(None, g
 
 
 @app.delete("/api/rollup/status")
-async def api_rollup_cancel(job_id: str):
-    job = _state["jobs"].cancel(job_id)
+async def api_rollup_cancel(job_id: str, cancel_token: str = Query(..., min_length=1)):
+    job = _state["jobs"].cancel(job_id, watcher=cancel_token)
     if job is None:
         raise HTTPException(404, "unknown job_id")
+    # Still "running" here means other clients are watching the shared job:
+    # this client detached, the computation continues for them.
     return job.snapshot()
 
 

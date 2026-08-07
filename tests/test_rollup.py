@@ -59,6 +59,22 @@ def test_aggregate_reader_groups_by_depth1_child():
     assert groups["."].files == 1  # files at the prefix itself group as "."
 
 
+def test_aggregate_reader_counts_null_size_files():
+    batch = make_batch(
+        [
+            ("/x/a/", 100, 96, 1_000, 2_000),
+            ("/x/a/", None, None, 3_000, 4_000),  # FILE row with null size/used
+        ]
+    )
+    groups = {}
+    rows = aggregate_reader([batch], "/x/", 1, groups)
+    assert rows == 2
+    a = groups["a"]
+    assert a.files == 2  # null-size rows are still files
+    assert (a.bytes, a.used) == (100, 96)
+    assert a.mtime_ns == 3_000
+
+
 def test_aggregate_reader_progress_callback():
     seen = []
     groups = {}

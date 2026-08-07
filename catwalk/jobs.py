@@ -34,6 +34,7 @@ class Job:
     event: threading.Event = field(default_factory=threading.Event, repr=False)
     cancel_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     future: Future | None = field(default=None, repr=False)
+    watchers: set[str] = field(default_factory=set, repr=False)
 
     def snapshot(self) -> dict:
         now = self.finished or time.monotonic()
@@ -58,19 +59,32 @@ class JobManager:
         self._slots = threading.BoundedSemaphore(max_workers + max_queue)
         self._closed = False
 
-    def submit(self, key: tuple, fn) -> Job:
-        """Start ``fn(progress_cb)`` or return an active job with the same key."""
+    def submit(self, key: tuple, fn) -> tuple[Job, str]:
+        """Start ``fn(progress_cb)`` or join an active job with the same key.
+
+        Returns ``(job, watcher)``. Deduplicated jobs are shared between
+        clients, so each caller gets its own watcher token; the job is only
+        cancelled once every watcher has detached via :meth:`cancel`.
+        """
         with self._lock:
             if self._closed:
                 raise RuntimeError("job manager is closed")
             self._prune_locked()
+            watcher = uuid.uuid4().hex[:12]
             existing = self._by_key.get(key)
-            if existing and existing.status in ("queued", "running"):
-                return existing
+            if (
+                existing
+                and existing.status in ("queued", "running")
+                # A doomed job (last watcher just detached) is not joinable:
+                # fall through and start a fresh computation instead.
+                and not existing.cancel_requested.is_set()
+            ):
+                existing.watchers.add(watcher)
+                return existing, watcher
             if not self._slots.acquire(blocking=False):
                 raise JobQueueFull("rollup queue is full; retry after active scans finish")
 
-            job = Job(id=uuid.uuid4().hex[:12], key=key)
+            job = Job(id=uuid.uuid4().hex[:12], key=key, watchers={watcher})
             self._jobs[job.id] = job
             self._by_key[key] = job
 
@@ -112,7 +126,7 @@ class JobManager:
                 raise
             job.future = future
             future.add_done_callback(lambda _future: self._future_done(job))
-            return job
+            return job, watcher
 
     def _future_done(self, job: Job):
         if job.future is not None and job.future.cancelled() and not job.event.is_set():
@@ -128,13 +142,23 @@ class JobManager:
             self._prune_locked()
             return self._jobs.get(job_id)
 
-    def cancel(self, job_id: str) -> Job | None:
+    def cancel(self, job_id: str, watcher: str | None = None) -> Job | None:
+        """Detach ``watcher`` from a job; cancel it once no watchers remain.
+
+        ``watcher=None`` force-cancels regardless of other watchers (used by
+        :meth:`close`); HTTP callers must always pass their own token so one
+        client leaving cannot kill a job other clients still poll.
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
             if job.status not in ("queued", "running"):
                 return job
+            if watcher is not None:
+                job.watchers.discard(watcher)
+                if job.watchers:
+                    return job
             job.cancel_requested.set()
             future = job.future
         if future is not None:
