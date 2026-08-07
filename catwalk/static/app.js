@@ -241,9 +241,18 @@ function renderTable(data) {
       if (stats) {
         ru.textContent = `${humanSize(stats.total_bytes)} · ${stats.file_count.toLocaleString()} files`;
         ru.title = `descendant total; last modified ${fmtTime(stats.last_modified)}`;
+      } else if (rollup) {
+        // Rollup finished but this child is not in it: a truncated result
+        // only includes the largest children — "…" would read as a hang.
+        ru.textContent = "—";
+        ru.className = "num dim";
+        ru.title = rollup.truncated
+          ? "not among the largest children in the rollup (result truncated)"
+          : "no descendant files";
       } else {
         ru.textContent = "…";
         ru.className = "num dim";
+        ru.title = "rollup still computing";
       }
     }
     tr.appendChild(ru);
@@ -285,7 +294,11 @@ function renderRollup(result) {
   const byName = Object.create(null);
   for (const c of result.children) byName[c.name] = c;
   rollups.delete(result.path);
-  rollups.set(result.path, { children: byName, totals: result.totals });
+  rollups.set(result.path, {
+    children: byName,
+    totals: result.totals,
+    truncated: !!result.children_truncated,
+  });
   while (rollups.size > 50) rollups.delete(rollups.keys().next().value);
 
   const t = result.totals;
@@ -532,7 +545,23 @@ async function navigate(path) {
   if (!state.path.startsWith(treeRoot)) rebuildTree(state.path);
 
   const loaded = await loadPage(1, { fromNav: true });
-  if (!loaded || state.path !== target) return;
+  if (state.path !== target) return;
+  if (!loaded) {
+    // loadPage already showed the failure banner; don't leave the previous
+    // directory's rows, rollup, and pager rendered under the new path.
+    $("table-body").textContent = "";
+    $("table-empty").classList.add("hidden");
+    $("listing-summary").textContent = "";
+    $("page-info").textContent = "—";
+    $("prev-page").disabled = true;
+    $("next-page").disabled = true;
+    $("rollup-status").textContent = "";
+    $("rollup-totals").textContent = "";
+    $("rollup-children").textContent = "";
+    $("export-rollup").classList.add("hidden");
+    updateExportLinks();
+    return;
+  }
   expandTo(target);
   loadRollup(target);
 }
