@@ -1,0 +1,15 @@
+# Credentials / local environment -- never commit
+.env
+
+# Local tool state
+.claude/
+
+# Python
+.ruff_cache/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/

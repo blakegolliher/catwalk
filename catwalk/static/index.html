@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Catwalk — VAST Catalog browser</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐈</text></svg>">
+</head>
+<body>
+  <header>
+    <div class="brand">Catwalk <span class="cat">🐈</span></div>
+    <select id="view-select" title="VAST views (from VMS)">
+      <option value="">— select view —</option>
+    </select>
+    <form id="path-form">
+      <input id="path-input" type="text" placeholder="/path/to/browse" spellcheck="false" autocomplete="off">
+    </form>
+    <div id="breadcrumb" class="breadcrumb"></div>
+    <div class="spacer"></div>
+    <div id="freshness" class="freshness" title="The VAST Catalog is re-indexed from periodic snapshots; it is not a live view."></div>
+    <button id="theme-toggle" title="Toggle dark / light">◐</button>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main>
+    <nav id="tree" class="tree" aria-label="Directory tree"></nav>
+
+    <section class="content">
+      <div class="toolbar">
+        <label>Type
+          <select id="type-filter">
+            <option value="all">all</option>
+            <option value="dir">dirs</option>
+            <option value="file">files</option>
+            <option value="other">other</option>
+          </select>
+        </label>
+        <input id="name-filter" type="text" placeholder="filter by name…" spellcheck="false">
+        <span id="listing-summary" class="summary"></span>
+        <div class="spacer"></div>
+        <a id="export-listing" class="btn" title="Download current listing as CSV">CSV: listing</a>
+        <a id="export-rollup" class="btn hidden" title="Download rollup as CSV">CSV: rollup</a>
+      </div>
+
+      <div class="table-wrap">
+        <table id="file-table">
+          <thead>
+            <tr>
+              <th data-sort="name">Name</th>
+              <th>Type</th>
+              <th data-sort="size" class="num">Size</th>
+              <th class="num">Used</th>
+              <th data-sort="mtime">Modified</th>
+              <th data-sort="atime">Accessed</th>
+              <th data-sort="owner_name">Owner</th>
+              <th class="num">Rollup</th>
+            </tr>
+          </thead>
+          <tbody id="table-body"></tbody>
+        </table>
+        <div id="table-empty" class="empty hidden">no entries (empty directory or path not found)</div>
+      </div>
+
+      <div class="pager">
+        <button id="prev-page">◀ prev</button>
+        <span id="page-info"></span>
+        <form id="jump-form" class="jump">
+          <input id="jump-input" type="number" min="1" title="jump to page">
+        </form>
+        <button id="next-page">next ▶</button>
+        <div class="spacer"></div>
+        <label>rows
+          <select id="page-size">
+            <option>20</option>
+            <option>50</option>
+            <option>100</option>
+          </select>
+        </label>
+      </div>
+    </section>
+  </main>
+
+  <footer id="rollup-bar" class="rollup-bar">
+    <div id="rollup-status" class="rollup-status">select a directory to see its rollup</div>
+    <div id="rollup-totals" class="rollup-totals"></div>
+    <div id="rollup-children" class="rollup-children"></div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

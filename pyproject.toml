@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catwalk"
+version = "0.1.0"
+description = "Interactive web browser for the VAST Catalog (vastdb SDK + FastAPI)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110,<2",
+    "uvicorn>=0.27,<1",
+    "vastdb>=1.1,<3",
+    "vastpy>=0.3,<1",
+    "pyarrow>=14,<24",
+    "numpy>=1.24,<3",
+    "anyio>=3.7,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "httpx>=0.27,<1",
+    "httpx2>=2,<3",
+    "ruff>=0.4,<1",
+]
+
+[project.scripts]
+catwalk = "catwalk.config:main"
+
+[tool.setuptools.packages.find]
+include = ["catwalk*"]
+
+[tool.setuptools.package-data]
+catwalk = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Verbatim /proc/net/tcp fixture lines cannot be wrapped.
+"tests/test_netinfo.py" = ["E501"]
