@@ -34,6 +34,24 @@ def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _vms_host(value: str | None) -> str | None:
+    """Reduce VMS_ADDRESS to host[:port]. vastpy builds https://{address}/...
+    itself, so a pasted http(s):// URL would otherwise dial a host named
+    'http'; accept both forms."""
+    if not value:
+        return value
+    v = value.strip().rstrip("/")
+    if "://" not in v:
+        return v or None
+    parsed = urlparse(v)
+    host = parsed.hostname or ""
+    if ":" in host:  # bare IPv6 literal needs brackets inside a URL
+        host = f"[{host}]"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return host or None
+
+
 @dataclass
 class Config:
     # Data plane
@@ -189,7 +207,7 @@ def load_config() -> Config:
         secret_key=_env("VASTDB_SECRET_KEY"),
         data_endpoints=[e.strip() for e in eps.split(",") if e.strip()] if eps else None,
         auto_endpoints=_env_bool("CATWALK_AUTO_ENDPOINTS"),
-        vms_address=_env("VMS_ADDRESS"),
+        vms_address=_vms_host(_env("VMS_ADDRESS")),
         vms_user=_env("VMS_USER"),
         vms_password=_env("VMS_PASSWORD"),
         host=_env("CATWALK_HOST", "0.0.0.0"),
