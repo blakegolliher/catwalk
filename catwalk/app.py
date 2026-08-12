@@ -453,11 +453,13 @@ async def api_health():
     else:
         backend_health = await _probe(_state["backend"].health)
         if backend_health is None:
+            # A probe that timed out proves slowness, not absence: a busy
+            # cluster (startup warm pass, big rollup) drowns the probe while
+            # serving real queries fine. Report unknown (null), not down --
+            # only a probe that actually failed sets catalog_reachable false.
             backend_health = {
-                "vastdb": "error: health probe timed out",
-                "catalog_reachable": False,
-                # The probe drowned, but the pinned epoch is known locally --
-                # report it so a busy cluster doesn't read as "pinning broken".
+                "vastdb": "timeout: health probe timed out (cluster busy or unreachable)",
+                "catalog_reachable": None,
                 "catalog_snapshot": _state["backend"].peek_epoch(),
             }
     if cfg.mock:

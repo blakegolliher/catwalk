@@ -78,5 +78,41 @@ def test_health_reports_timeout_instead_of_hanging(slow_client, monkeypatch):
     body = slow_client.get("/api/health").json()
     elapsed = time.perf_counter() - t0
     assert elapsed < 7.0, f"health hung on a wedged backend probe ({elapsed:.2f}s)"
-    assert body["catalog_reachable"] is False
+    # A timed-out probe proves slowness, not absence: unknown (None), not down.
+    assert body["catalog_reachable"] is None
     assert "timed out" in body["vastdb"]
+
+
+def _unconnected_vast_backend():
+    import threading
+
+    from catwalk.catalog import VastBackend
+
+    backend = VastBackend.__new__(VastBackend)
+    backend._epoch = None
+    backend._epoch_checked = float("-inf")
+    backend._epoch_lock = threading.Lock()
+    backend._last_ok = float("-inf")
+
+    class ExplodingSession:
+        def transaction(self):
+            raise RuntimeError("no cluster in tests")
+
+    backend.session = ExplodingSession()
+    return backend
+
+
+def test_health_served_from_recent_query_success_without_probing():
+    """Recent successful traffic proves reachability; health must not add a
+    probe query on top of the load that traffic is creating."""
+    backend = _unconnected_vast_backend()
+    backend._last_ok = time.monotonic()
+    body = backend.health()  # the session raises if health actually probes
+    assert body["catalog_reachable"] is True
+
+
+def test_health_probes_when_no_recent_success():
+    backend = _unconnected_vast_backend()
+    body = backend.health()
+    assert body["catalog_reachable"] is False
+    assert "no cluster in tests" in body["vastdb"]

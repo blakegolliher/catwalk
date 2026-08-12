@@ -105,19 +105,29 @@ async function loadViews() {
   } catch (e) { /* view browsing is optional */ }
 }
 
+const HEALTH_BANNER = "VAST Catalog is not reachable on this cluster — ";
+
+/* Polls /api/health: quickly (15s) until the catalog is confirmed reachable,
+   then slowly (60s) to notice if it goes away. catalog_reachable is
+   three-valued: true, false, or null ("probe timed out — busy, not down",
+   e.g. during the startup warm pass); only a definitive false banners. */
 async function loadHealth() {
+  let reachable = null;
   try {
     const { body } = await api("/api/health");
     const bits = [body.snapshot_hint];
     if (body.mode === "mock") bits.push("· MOCK DATA");
-    if (!body.catalog_reachable) {
-      showBanner("VAST Catalog is not reachable on this cluster — " +
-                 (body.vastdb || "check /api/health"));
+    reachable = body.catalog_reachable;
+    if (reachable === false) {
+      showBanner(HEALTH_BANNER + (body.vastdb || "check /api/health"));
+    } else if (reachable === true && $("banner").textContent.startsWith(HEALTH_BANNER)) {
+      hideBanner();
     }
     $("freshness").textContent = bits.join(" ");
   } catch (e) {
     $("freshness").textContent = "backend unreachable";
   }
+  setTimeout(loadHealth, reachable === true ? 60000 : 15000);
 }
 
 function renderBreadcrumb() {

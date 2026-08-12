@@ -222,6 +222,11 @@ def merge_groups(
 
 CATALOG_BUCKET = "vast-big-catalog-bucket"
 
+# A catalog query that succeeded this recently proves reachability; health
+# then answers instantly instead of running a probe query that would compete
+# with (and lose to) the very traffic proving the cluster is fine.
+_HEALTH_FRESH_S = 30.0
+
 
 def newest_catalog_snapshot(api, prefix: str) -> str | None:
     """Name of the newest catalog snapshot, or None if there are none.
@@ -295,6 +300,7 @@ class VastBackend:
         self._epoch: str | None = None
         self._epoch_checked = float("-inf")
         self._epoch_lock = threading.Lock()
+        self._last_ok = float("-inf")  # monotonic time of the last successful query
 
     def _query_config(self, num_splits: int | None = None):
         from vastdb.config import QueryConfig
@@ -407,11 +413,13 @@ class VastBackend:
                 columns=columns, predicate=predicate, config=self._query_config()
             )
             for batch in reader:
+                self._last_ok = time.monotonic()
                 if client_name_filter and batch.num_rows:
                     mask = pc.match_substring(batch.column("name"), client_name_filter)
                     batch = batch.filter(mask)
                 if batch.num_rows:
                     yield batch
+        self._last_ok = time.monotonic()
 
     def scan_subtree_files(
         self, prefix: str, columns: list[str], epoch: str | None = None
@@ -425,7 +433,10 @@ class VastBackend:
                 predicate=(_.element_type == "FILE") & (_.parent_path.startswith(prefix)),
                 config=self._query_config(),
             )
-            yield from reader
+            for batch in reader:
+                self._last_ok = time.monotonic()
+                yield batch
+        self._last_ok = time.monotonic()
 
     def rollup_groups(
         self,
@@ -472,6 +483,7 @@ class VastBackend:
                 )
                 fed = 0
                 for batch in reader:
+                    self._last_ok = time.monotonic()
                     if batch.num_rows == 0:
                         continue
                     pending.add(pool.submit(aggregate_batch, batch))
@@ -506,23 +518,31 @@ class VastBackend:
                 )
                 .read_all()
             )
+        self._last_ok = time.monotonic()
         return dirs.column("name").to_pylist()
 
     def health(self) -> dict:
         from ibis import _
 
         epoch = self.peek_epoch()
+        ok = {
+            "vastdb": "ok",
+            "catalog_reachable": True,
+            "mode": "vastdb",
+            "catalog_snapshot": epoch,
+        }
+        # Recent successful traffic (interactive, prefetch, or warmer) already
+        # proves the catalog answers -- skip the probe query rather than adding
+        # one more scan to whatever load that traffic is creating.
+        if time.monotonic() - self._last_ok < _HEALTH_FRESH_S:
+            return ok
         try:
             with self.session.transaction() as tx:
                 tx.catalog().select(
                     columns=["name"], predicate=(_.parent_path == "/"), limit_rows=1
                 ).read_all()
-            return {
-                "vastdb": "ok",
-                "catalog_reachable": True,
-                "mode": "vastdb",
-                "catalog_snapshot": epoch,
-            }
+            self._last_ok = time.monotonic()
+            return ok
         except Exception as e:  # surfaced in /api/health, never raised to UI
             return {
                 "vastdb": f"error: {e}",
