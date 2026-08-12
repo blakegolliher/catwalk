@@ -13,7 +13,7 @@ const state = {
   nameFilter: "",
 };
 
-let listing = null;            // last /api/ls response
+let listing = null;            // last successfully rendered /api/ls response
 const pageCache = new Map();   // listingKey+page -> response (client prefetch)
 const PAGE_CACHE_MAX = 50;
 let listingToken = 0;          // guards against stale listing renders
@@ -22,6 +22,13 @@ const rollups = new Map();     // path -> {children: {name -> stats}, totals}
 let rollupToken = 0;           // guards against stale poll renders
 let activeRollupJobId = null;
 let activeRollupCancelToken = null;
+let rollupInFlight = null;     // path whose rollup is being computed, else null
+
+// loadPage outcomes: a superseded load must not touch the UI (a newer load
+// owns it), while a failed load must leave honestly empty panels behind.
+const LOAD_OK = "ok";
+const LOAD_FAILED = "failed";
+const LOAD_SUPERSEDED = "superseded";
 const treeNodes = new Map();   // path -> {li, childrenUl, expanded}
 let treeRoot = "/";
 
@@ -175,11 +182,12 @@ async function loadPage(page, { fromNav = false } = {}) {
   try {
     data = await fetchPage(page);
   } catch (e) {
-    if (token !== listingToken) return false;
+    if (token !== listingToken) return LOAD_SUPERSEDED; // a newer load owns the UI
     showBanner(`listing failed: ${e.message}`);
-    return false;
+    clearListingUI();
+    return LOAD_FAILED;
   }
-  if (token !== listingToken || expectedKey !== listingKey()) return false;
+  if (token !== listingToken || expectedKey !== listingKey()) return LOAD_SUPERSEDED;
   listing = data;
   state.page = data.page;
   renderTable(data);
@@ -196,7 +204,7 @@ async function loadPage(page, { fromNav = false } = {}) {
     fetchPage(data.page + 2).catch(() => {});
   }
   updateExportLinks();
-  return true;
+  return LOAD_OK;
 }
 
 function renderTable(data) {
@@ -218,11 +226,11 @@ function renderTable(data) {
     tr.appendChild(el("td", "etype", e.element_type.toLowerCase()));
 
     const size = el("td", "num", isDir ? "—" : humanSize(e.size));
-    size.title = `logical size: ${e.size} B`;
+    size.title = e.size == null ? "logical size unknown" : `logical size: ${e.size} B`;
     tr.appendChild(size);
 
     const used = el("td", "num dim", isDir ? "—" : humanSize(e.used));
-    used.title = `used (post-reduction): ${e.used} B`;
+    used.title = e.used == null ? "used bytes unknown" : `used (post-reduction): ${e.used} B`;
     tr.appendChild(used);
 
     const mt = el("td", "dim", fmtTime(e.mtime));
@@ -242,17 +250,25 @@ function renderTable(data) {
         ru.textContent = `${humanSize(stats.total_bytes)} · ${stats.file_count.toLocaleString()} files`;
         ru.title = `descendant total; last modified ${fmtTime(stats.last_modified)}`;
       } else if (rollup) {
-        // Rollup finished but this child is not in it: a truncated result
-        // only includes the largest children — "…" would read as a hang.
+        // Rollup finished but this child is not in it. A truncated result
+        // only carries the largest children; a complete one seeds every
+        // child dir that existed when it was computed, so absence there
+        // means this directory is newer than the rollup.
         ru.textContent = "—";
         ru.className = "num dim";
         ru.title = rollup.truncated
           ? "not among the largest children in the rollup (result truncated)"
-          : "no descendant files";
-      } else {
+          : "not present when this rollup was computed (directory is newer)";
+      } else if (rollupInFlight === state.path) {
         ru.textContent = "…";
         ru.className = "num dim";
         ru.title = "rollup still computing";
+      } else {
+        // No rollup and none in flight: it failed or was skipped (the
+        // rollup panel below says why) — "…" would read as a hang.
+        ru.textContent = "—";
+        ru.className = "num dim";
+        ru.title = "no rollup available for this directory (see the rollup panel)";
       }
     }
     tr.appendChild(ru);
@@ -288,7 +304,42 @@ function resetListing() {
   forwardStreak = 0;
 }
 
+function clearListingUI() {
+  // Honest empty state after a failed load: no rows, pager, or summary from
+  // a directory (or sort/filter state) we are no longer showing.
+  listing = null;
+  $("table-body").textContent = "";
+  $("table-empty").classList.add("hidden");
+  $("listing-summary").textContent = "";
+  $("page-info").textContent = "—";
+  $("prev-page").disabled = true;
+  $("next-page").disabled = true;
+  $("jump-input").removeAttribute("max"); // a stale max blocks valid retries
+  updateExportLinks();
+}
+
 /* ---------- rollup ---------- */
+
+function cancelActiveRollup() {
+  // Invalidate any in-flight rollup load/poll chain and detach from the
+  // server-side job. Every transition (navigate, new rollup) goes through
+  // here so a stale poll can never repaint panels that were cleared.
+  rollupToken++;
+  rollupInFlight = null;
+  if (activeRollupJobId) {
+    api("/api/rollup/status",
+        { job_id: activeRollupJobId, cancel_token: activeRollupCancelToken },
+        { method: "DELETE" }).catch(() => {});
+    activeRollupJobId = null;
+    activeRollupCancelToken = null;
+  }
+}
+
+function resetRollupPanels() {
+  $("rollup-totals").textContent = "";
+  $("rollup-children").textContent = "";
+  $("export-rollup").classList.add("hidden");
+}
 
 function renderRollup(result) {
   const byName = Object.create(null);
@@ -339,24 +390,30 @@ function renderRollup(result) {
     wrap.appendChild(row);
   }
 
-  if (result.path === state.path && listing) renderTable(listing);
+  if (listing && listing.path === state.path && result.path === state.path) {
+    renderTable(listing);
+  }
   annotateTree(result.path);
-  $("export-rollup").classList.remove("hidden");
-  updateExportLinks();
+  if (result.path === state.path) {
+    // The export href is built from state.path; unhiding it for another
+    // path would offer a CSV of a rollup that was never computed (404).
+    $("export-rollup").classList.remove("hidden");
+    updateExportLinks();
+  }
+}
+
+function rollupSettled() {
+  // Terminal state (success, failure, or policy skip) for the rollup owning
+  // the current token: flip any "…" table cells to their honest state.
+  rollupInFlight = null;
+  if (listing && listing.path === state.path) renderTable(listing);
 }
 
 async function loadRollup(path) {
+  cancelActiveRollup();
   const token = ++rollupToken;
-  if (activeRollupJobId) {
-    api("/api/rollup/status",
-        { job_id: activeRollupJobId, cancel_token: activeRollupCancelToken },
-        { method: "DELETE" }).catch(() => {});
-    activeRollupJobId = null;
-    activeRollupCancelToken = null;
-  }
-  $("rollup-totals").textContent = "";
-  $("rollup-children").textContent = "";
-  $("export-rollup").classList.add("hidden");
+  rollupInFlight = path;
+  resetRollupPanels();
   renderRollupProgress(`computing rollup of ${path} …`);
   let r;
   try {
@@ -371,6 +428,7 @@ async function loadRollup(path) {
     } else {
       $("rollup-status").textContent = `rollup unavailable: ${e.message}`;
     }
+    rollupSettled();
     return;
   }
   if (token !== rollupToken) {
@@ -381,7 +439,7 @@ async function loadRollup(path) {
     }
     return;
   }
-  if (r.status === 200) { renderRollup(r.body); return; }
+  if (r.status === 200) { rollupInFlight = null; renderRollup(r.body); return; }
 
   // 202: poll the job until done.
   const jobId = r.body.job_id;
@@ -395,6 +453,7 @@ async function loadRollup(path) {
     } catch (e) {
       if (token !== rollupToken) return;
       $("rollup-status").textContent = `rollup failed: ${e.message}`;
+      rollupSettled();
       return;
     }
     if (token !== rollupToken) return;
@@ -403,6 +462,7 @@ async function loadRollup(path) {
         activeRollupJobId = null;
         activeRollupCancelToken = null;
       }
+      rollupInFlight = null;
       renderRollup(s.body.result);
       return;
     }
@@ -412,6 +472,7 @@ async function loadRollup(path) {
         activeRollupCancelToken = null;
       }
       $("rollup-status").textContent = `rollup failed: ${s.body.error}`;
+      rollupSettled();
       return;
     }
     const queueText = s.body.status === "queued"
@@ -520,12 +581,17 @@ function highlightTree() {
 }
 
 function annotateTree(rollupPath) {
+  // One rollup owns the badges of its directory level: paint the children it
+  // reports and clear the rest, so badges from an older rollup (or children a
+  // truncated result no longer vouches for) cannot mix vintages.
   const rollup = rollups.get(rollupPath);
   if (!rollup) return;
-  for (const [name, stats] of Object.entries(rollup.children)) {
-    if (name === ".") continue;
-    const rec = treeNodes.get(rollupPath + name + "/");
-    if (rec) rec.badge.textContent = humanSize(stats.total_bytes);
+  for (const [p, rec] of treeNodes) {
+    if (p === rollupPath || !p.startsWith(rollupPath)) continue;
+    const name = p.slice(rollupPath.length, -1);
+    if (name.includes("/")) continue; // deeper descendant, not a direct child
+    const stats = rollup.children[name];
+    rec.badge.textContent = stats ? humanSize(stats.total_bytes) : "";
   }
 }
 
@@ -541,27 +607,21 @@ async function navigate(path) {
   hideBanner();
   $("path-input").value = state.path;
   renderBreadcrumb();
+  // Tear down the previous directory's async work before the first await:
+  // a surviving rollup poll would repaint the panels this transition owns.
+  cancelActiveRollup();
+  resetRollupPanels();
+  $("rollup-status").textContent = "";
+  updateExportLinks();
+  highlightTree();
 
   if (!state.path.startsWith(treeRoot)) rebuildTree(state.path);
 
-  const loaded = await loadPage(1, { fromNav: true });
-  if (state.path !== target) return;
-  if (!loaded) {
-    // loadPage already showed the failure banner; don't leave the previous
-    // directory's rows, rollup, and pager rendered under the new path.
-    $("table-body").textContent = "";
-    $("table-empty").classList.add("hidden");
-    $("listing-summary").textContent = "";
-    $("page-info").textContent = "—";
-    $("prev-page").disabled = true;
-    $("next-page").disabled = true;
-    $("rollup-status").textContent = "";
-    $("rollup-totals").textContent = "";
-    $("rollup-children").textContent = "";
-    $("export-rollup").classList.add("hidden");
-    updateExportLinks();
-    return;
-  }
+  const result = await loadPage(1, { fromNav: true });
+  if (state.path !== target) return;        // a newer navigate owns the UI
+  if (result === LOAD_FAILED) return;       // loadPage cleared the listing; keep panels empty
+  // LOAD_OK — or superseded by a same-path reload (sort/filter/pager click
+  // mid-navigate), whose render is equally valid for target: finish up.
   expandTo(target);
   loadRollup(target);
 }
