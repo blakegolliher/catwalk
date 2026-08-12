@@ -153,7 +153,7 @@ def test_prefetch_warms_child_listings():
 
     b = CountingBackend()
     svc = make_service(b, prefetch_children=4)
-    entry = svc._base_listing("/projects/proj-01/", "", "")
+    entry, _hit = svc._base_listing("/projects/proj-01/", "", "")
     futures = svc.prefetch_children("/projects/proj-01/", entry)
     assert futures, "expected prefetch futures for child dirs"
     wait(futures, timeout=30)
@@ -180,14 +180,14 @@ def test_hung_prefetch_does_not_block_interactive_listing(monkeypatch):
     assert page["total_rows"] > 0
     # The timed-out join fell through to a direct query and cached it.
     # (No call-count assertion: this listing's own child prefetches add calls.)
-    assert svc.cache.get(("/projects/proj-03/", "", "")) is not None
+    assert svc.cache.get((None, "/projects/proj-03/", "", "")) is not None
     svc.close()
 
 
 def test_prefetch_disabled_when_zero():
     b = CountingBackend()
     svc = make_service(b, prefetch_children=0)
-    entry = svc._base_listing("/projects/proj-02/", "", "")
+    entry, _hit = svc._base_listing("/projects/proj-02/", "", "")
     assert svc.prefetch_children("/projects/proj-02/", entry) == []
 
 
@@ -214,5 +214,5 @@ def test_filtered_listing_requeries_when_cache_truncated():
 
 def test_listing_cache_accounts_for_all_sort_variants():
     svc = make_service(MockBackend())
-    entry = svc._base_listing("/home/alice/code/", "", "")
+    entry, _hit = svc._base_listing("/home/alice/code/", "", "")
     assert svc.cache.total_bytes == entry["table"].nbytes * 4

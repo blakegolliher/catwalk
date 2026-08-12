@@ -34,6 +34,13 @@ def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_bool_default(name: str, default: bool) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if v == "":
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
 def _vms_host(value: str | None) -> str | None:
     """Reduce VMS_ADDRESS to host[:port]. vastpy builds https://{address}/...
     itself, so a pasted http(s):// URL would otherwise dial a host named
@@ -88,6 +95,13 @@ class Config:
     query_threads: int = 8
     query_concurrency: int = 24
     query_timeout: float = 60.0  # per-read socket timeout; 0 disables
+    # Snapshot pinning: key caches by the newest catalog snapshot and read
+    # from it, so invalidation is exact (a new snapshot flips every cache
+    # at once) instead of wall-clock TTL. Falls back to live queries when
+    # the cluster has no catalog snapshots.
+    snapshot_pin: bool = True
+    snapshot_poll: float = 60.0
+    snapshot_prefix: str = "big_catalog"
     prefetch_children: int = 8
     warm_paths: list[str] | None = None
     warm_depth: int = 2
@@ -140,6 +154,7 @@ class Config:
         integer("CATWALK_QUERY_THREADS", self.query_threads, 1, 128)
         integer("CATWALK_QUERY_CONCURRENCY", self.query_concurrency, 0, 256)
         number("CATWALK_QUERY_TIMEOUT", self.query_timeout, allow_zero=True)
+        number("CATWALK_SNAPSHOT_POLL", self.snapshot_poll)
         integer("CATWALK_PREFETCH_CHILDREN", self.prefetch_children, 0)
         integer("CATWALK_WARM_DEPTH", self.warm_depth, 0)
         integer("CATWALK_WARM_THREADS", self.warm_threads, 1, 64)
@@ -231,6 +246,9 @@ def load_config() -> Config:
         query_threads=_env_num("CATWALK_QUERY_THREADS", int, 8),
         query_concurrency=_env_num("CATWALK_QUERY_CONCURRENCY", int, 24),
         query_timeout=_env_num("CATWALK_QUERY_TIMEOUT", float, 60.0),
+        snapshot_pin=_env_bool_default("CATWALK_SNAPSHOT_PIN", True),
+        snapshot_poll=_env_num("CATWALK_SNAPSHOT_POLL", float, 60.0),
+        snapshot_prefix=_env("CATWALK_SNAPSHOT_PREFIX", "big_catalog"),
         prefetch_children=_env_num("CATWALK_PREFETCH_CHILDREN", int, 8),
         warm_paths=[p.strip() for p in warm.split(",") if p.strip()] if warm else None,
         warm_depth=_env_num("CATWALK_WARM_DEPTH", int, 2),

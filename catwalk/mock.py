@@ -182,6 +182,15 @@ class MockBackend:
 
     def __init__(self):
         self.catalog = MockCatalog()
+        # Settable in tests to exercise epoch-keyed caching; None = live
+        # (matches a cluster without catalog snapshots).
+        self.epoch: str | None = None
+
+    def current_epoch(self) -> str | None:
+        return self.epoch
+
+    def peek_epoch(self) -> str | None:
+        return self.epoch
 
     def list_dir(
         self,
@@ -189,6 +198,7 @@ class MockBackend:
         columns: list[str],
         element_type: str | None = None,
         name_contains: str | None = None,
+        epoch: str | None = None,
     ) -> Iterator[pa.RecordBatch]:
         if path not in self.catalog.tree:
             return
@@ -203,7 +213,9 @@ class MockBackend:
             tbl = tbl.filter(pc.match_substring(tbl.column("name"), name_contains))
         yield from tbl.select(columns).to_batches(max_chunksize=BATCH_ROWS)
 
-    def scan_subtree_files(self, prefix: str, columns: list[str]) -> Iterator[pa.RecordBatch]:
+    def scan_subtree_files(
+        self, prefix: str, columns: list[str], epoch: str | None = None
+    ) -> Iterator[pa.RecordBatch]:
         for path in sorted(self.catalog.tree):
             if not path.startswith(prefix):
                 continue
@@ -212,7 +224,9 @@ class MockBackend:
             if tbl.num_rows:
                 yield from tbl.select(columns).to_batches(max_chunksize=BATCH_ROWS)
 
-    def list_child_dirs(self, path: str, limit: int | None = None) -> list[str]:
+    def list_child_dirs(
+        self, path: str, limit: int | None = None, epoch: str | None = None
+    ) -> list[str]:
         spec = self.catalog.tree.get(path)
         dirs = list(spec["dirs"]) if spec else []
         return dirs[:limit] if limit is not None else dirs

@@ -220,6 +220,29 @@ def merge_groups(
 
 # ---- real backend (vastdb SDK over data VIPs) -------------------------------
 
+CATALOG_BUCKET = "vast-big-catalog-bucket"
+
+
+def newest_catalog_snapshot(api, prefix: str) -> str | None:
+    """Name of the newest catalog snapshot, or None if there are none.
+
+    One (paged) S3 LIST against the catalog bucket -- no transaction, no
+    data scan. Snapshot names embed a zero-padded UTC timestamp
+    (big_catalog_2026-08-12_19_01_25_UTC), so within one naming prefix the
+    lexicographic max is the newest.
+    """
+    names: list[str] = []
+    token = None
+    while True:
+        page, truncated, token = api.list_snapshots(
+            bucket=CATALOG_BUCKET, name_prefix=prefix, next_token=token
+        )
+        names.extend(page)
+        if not truncated or not page:
+            break
+    snaps = [n.strip("/").removeprefix(".snapshot/") for n in names]
+    return max(snaps) if snaps else None
+
 
 def _drop_sdk_concurrency_notice(record: logging.LogRecord) -> bool:
     return "heuristic for concurrency" not in record.getMessage()
@@ -269,11 +292,74 @@ class VastBackend:
             secret=cfg.secret_key,
             timeout=cfg.query_timeout or None,
         )
+        self._epoch: str | None = None
+        self._epoch_checked = float("-inf")
+        self._epoch_lock = threading.Lock()
 
     def _query_config(self, num_splits: int | None = None):
         from vastdb.config import QueryConfig
 
         return QueryConfig(data_endpoints=self.fanout, num_splits=num_splits or self.cfg.num_splits)
+
+    def current_epoch(self) -> str | None:
+        """Newest catalog snapshot name, refreshed at most every
+        cfg.snapshot_poll seconds. None when pinning is disabled or the
+        cluster has no catalog snapshots -- queries then run against the
+        live table and caching degrades to pure TTL.
+
+        Non-blocking for concurrent callers: whoever finds the value stale
+        marks it fresh first and does the (single) LIST; everyone else keeps
+        using the previous epoch meanwhile.
+        """
+        if not self.cfg.snapshot_pin:
+            return None
+        now = time.monotonic()
+        with self._epoch_lock:
+            if now - self._epoch_checked < self.cfg.snapshot_poll:
+                return self._epoch
+            self._epoch_checked = now
+            previous = self._epoch
+        try:
+            fresh = newest_catalog_snapshot(self.session.api, self.cfg.snapshot_prefix)
+        except Exception as e:
+            log.warning("catalog snapshot listing failed (%s); keeping epoch %r", e, previous)
+            return previous
+        if fresh != previous:
+            log.info("catalog snapshot epoch: %r -> %r", previous, fresh)
+        with self._epoch_lock:
+            self._epoch = fresh
+        return fresh
+
+    def peek_epoch(self) -> str | None:
+        """Last-resolved epoch without any network I/O (for health reporting
+        even when the cluster is too busy to answer a probe)."""
+        with self._epoch_lock:
+            return self._epoch
+
+    def _drop_epoch(self, epoch: str) -> None:
+        """Forget a bad epoch so the next current_epoch() re-resolves."""
+        with self._epoch_lock:
+            if self._epoch == epoch:
+                self._epoch = None
+                self._epoch_checked = float("-inf")
+
+    def _catalog(self, tx, epoch: str | None):
+        """Catalog table pinned to the epoch snapshot, or live when unpinned.
+
+        A pinned lookup that fails (snapshot aged out between polls) drops
+        the epoch and falls back to the live table rather than erroring the
+        request; the cached result is then at most one TTL stale.
+        """
+        if epoch:
+            from vastdb.bucket import Bucket
+
+            try:
+                snap = Bucket(name=f"{CATALOG_BUCKET}/.snapshot/{epoch}", tx=tx)
+                return tx.catalog(snapshot=snap)
+            except Exception as e:
+                log.warning("catalog snapshot %s unusable (%s); querying live", epoch, e)
+                self._drop_epoch(epoch)
+        return tx.catalog()
 
     def list_dir(
         self,
@@ -281,6 +367,7 @@ class VastBackend:
         columns: list[str],
         element_type: str | None = None,
         name_contains: str | None = None,
+        epoch: str | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Yield RecordBatches for one directory (equality on parent_path).
 
@@ -296,27 +383,27 @@ class VastBackend:
         elif element_type:
             base = base & (_.element_type == element_type)
         if not name_contains:
-            yield from self._run(base, columns, None)
+            yield from self._run(base, columns, None, epoch)
             return
         # Decide pushdown-vs-client-side on the FIRST batch, so a fallback
         # can never duplicate rows already yielded.
-        gen = self._run(base & _.name.contains(name_contains), columns, None)
+        gen = self._run(base & _.name.contains(name_contains), columns, None, epoch)
         try:
             first = next(gen)
         except StopIteration:
             return
         except (NotImplementedError, ValueError, TypeError):
             gen.close()
-            yield from self._run(base, columns, name_contains)
+            yield from self._run(base, columns, name_contains, epoch)
             return
         yield first
         yield from gen
 
     def _run(
-        self, predicate, columns: list[str], client_name_filter: str | None
+        self, predicate, columns: list[str], client_name_filter: str | None, epoch: str | None
     ) -> Iterator[pa.RecordBatch]:
         with self.session.transaction() as tx:
-            reader = tx.catalog().select(
+            reader = self._catalog(tx, epoch).select(
                 columns=columns, predicate=predicate, config=self._query_config()
             )
             for batch in reader:
@@ -326,12 +413,14 @@ class VastBackend:
                 if batch.num_rows:
                     yield batch
 
-    def scan_subtree_files(self, prefix: str, columns: list[str]) -> Iterator[pa.RecordBatch]:
+    def scan_subtree_files(
+        self, prefix: str, columns: list[str], epoch: str | None = None
+    ) -> Iterator[pa.RecordBatch]:
         """Yield RecordBatches of every FILE row under prefix (recursive)."""
         from ibis import _
 
         with self.session.transaction() as tx:
-            reader = tx.catalog().select(
+            reader = self._catalog(tx, epoch).select(
                 columns=columns,
                 predicate=(_.element_type == "FILE") & (_.parent_path.startswith(prefix)),
                 config=self._query_config(),
@@ -339,7 +428,11 @@ class VastBackend:
             yield from reader
 
     def rollup_groups(
-        self, prefix: str, depth: int, rows_cb: Callable[[int], None] | None = None
+        self,
+        prefix: str,
+        depth: int,
+        rows_cb: Callable[[int], None] | None = None,
+        epoch: str | None = None,
     ) -> tuple[dict[str, FolderStats], int]:
         """Pipelined rollup: one select() stream (the SDK fans fetching out
         across the duplicated endpoint list), consumed through a bounded set
@@ -372,7 +465,7 @@ class VastBackend:
 
         try:
             with self.session.transaction() as tx:
-                reader = tx.catalog().select(
+                reader = self._catalog(tx, epoch).select(
                     columns=ROLLUP_COLUMNS,
                     predicate=(_.element_type == "FILE") & (_.parent_path.startswith(prefix)),
                     config=self._query_config(),
@@ -397,12 +490,14 @@ class VastBackend:
             pool.shutdown(wait=True, cancel_futures=True)
         return groups, total
 
-    def list_child_dirs(self, path: str, limit: int | None = None) -> list[str]:
+    def list_child_dirs(
+        self, path: str, limit: int | None = None, epoch: str | None = None
+    ) -> list[str]:
         from ibis import _
 
         with self.session.transaction() as tx:
             dirs = (
-                tx.catalog()
+                self._catalog(tx, epoch)
                 .select(
                     columns=["name"],
                     predicate=(_.element_type == "DIR") & (_.parent_path == path),
@@ -416,14 +511,25 @@ class VastBackend:
     def health(self) -> dict:
         from ibis import _
 
+        epoch = self.peek_epoch()
         try:
             with self.session.transaction() as tx:
                 tx.catalog().select(
                     columns=["name"], predicate=(_.parent_path == "/"), limit_rows=1
                 ).read_all()
-            return {"vastdb": "ok", "catalog_reachable": True, "mode": "vastdb"}
+            return {
+                "vastdb": "ok",
+                "catalog_reachable": True,
+                "mode": "vastdb",
+                "catalog_snapshot": epoch,
+            }
         except Exception as e:  # surfaced in /api/health, never raised to UI
-            return {"vastdb": f"error: {e}", "catalog_reachable": False, "mode": "vastdb"}
+            return {
+                "vastdb": f"error: {e}",
+                "catalog_reachable": False,
+                "mode": "vastdb",
+                "catalog_snapshot": epoch,
+            }
 
 
 def make_backend(cfg: Config):
@@ -470,9 +576,16 @@ class ListingService:
 
     def _base_listing(
         self, path: str, type_filter: str, name_filter: str, _join_prefetch: bool = True
-    ) -> dict:
-        """Cached (table, truncated) for one directory + filters."""
-        key = (path, type_filter or "", name_filter or "")
+    ) -> tuple[dict, bool]:
+        """Cached (table, truncated) for one directory + filters, plus
+        whether it was served from cache.
+
+        Keys include the catalog snapshot epoch: a new snapshot means new
+        keys, so every entry is invalidated at once and a cached listing
+        always describes exactly one catalog state. Old-epoch entries are
+        never revisited and age out via TTL/LRU."""
+        epoch = self.backend.current_epoch()
+        key = (epoch, path, type_filter or "", name_filter or "")
 
         # If a speculative prefetch of this directory is mid-flight, wait for
         # it rather than racing it with a duplicate scan (the two would
@@ -506,27 +619,41 @@ class ListingService:
             # in memory when the unfiltered table is cached and complete
             # (a truncated cache may be missing matching rows -- re-query).
             if type_filter or name_filter:
-                full = self.cache.get((path, "", ""))
+                full = self.cache.get((epoch, path, "", ""))
                 if full is not None and not full["truncated"]:
                     table = full["table"]
                     if type_filter:
                         table = _filter_listing_type(table, type_filter)
                     if name_filter:
                         table = table.filter(pc.match_substring(table.column("name"), name_filter))
-                    return _listing_entry(table, False), _listing_cost(table)
+                    derived = _listing_entry(table, False)
+                    derived["elapsed_s"] = 0.0  # derived in memory, no query
+                    return derived, _listing_cost(table)
 
-            return self._query_listing(path, type_filter, name_filter)
+            return self._query_listing(path, type_filter, name_filter, epoch)
 
-        entry, _hit = self.cache.get_or_compute(key, compute)
-        return entry
+        return self.cache.get_or_compute(key, compute)
 
-    def _query_listing(self, path: str, type_filter: str, name_filter: str) -> tuple[dict, int]:
-        """Run the backend query for one listing; returns (entry, nbytes)."""
+    def _query_listing(
+        self, path: str, type_filter: str, name_filter: str, epoch: str | None = None
+    ) -> tuple[dict, int]:
+        """Run the backend query for one listing; returns (entry, nbytes).
+
+        Logs one timing line per query, splitting gate wait (queued behind
+        other catalog work) from query time (cluster latency) -- the split
+        that tells you whether to tune concurrency or blame the cluster.
+        """
         element_type = {"file": "FILE", "dir": "DIR", "other": "OTHER"}.get(type_filter)
         batches, rows, truncated = [], 0, False
+        t0 = time.monotonic()
         with self._query_context():
+            gate_wait = time.monotonic() - t0
             it = self.backend.list_dir(
-                path, LISTING_COLUMNS, element_type=element_type, name_contains=name_filter or None
+                path,
+                LISTING_COLUMNS,
+                element_type=element_type,
+                name_contains=name_filter or None,
+                epoch=epoch,
             )
             try:
                 for batch in it:
@@ -540,28 +667,46 @@ class ListingService:
             finally:
                 if hasattr(it, "close"):
                     it.close()
+        elapsed = time.monotonic() - t0
+        filters = (f" type={type_filter}" if type_filter else "") + (
+            f" name~{name_filter}" if name_filter else ""
+        )
+        log.info(
+            "listing %s%s: %d rows%s in %.2fs (gate wait %.2fs, epoch %s)",
+            path,
+            filters,
+            rows,
+            " TRUNCATED" if truncated else "",
+            elapsed,
+            gate_wait,
+            epoch,
+        )
         if batches:
             table = pa.Table.from_batches(batches, schema=batches[0].schema)
         else:
             table = _empty_listing_table()
-        return _listing_entry(table, truncated), _listing_cost(table)
+        entry = _listing_entry(table, truncated)
+        entry["elapsed_s"] = round(elapsed, 3)
+        return entry, _listing_cost(table)
 
     def warm_listing(self, path: str, min_ttl: float = 0.0) -> list[str]:
         """Ensure the unfiltered listing of path is cached with at least
         min_ttl seconds of life left; re-query it otherwise. Returns the
         child directory names (the BFS frontier for the cache warmer).
 
-        May race an interactive request computing the same key -- harmless,
-        last write wins (same contract as TTLCache.get_or_compute).
+        Bypasses get_or_compute (a fresh-enough entry must be re-queried,
+        not returned), so it may race an interactive request computing the
+        same key -- harmless, last write wins.
         """
         path = normalize_prefix(path)
-        key = (path, "", "")
+        epoch = self.backend.current_epoch()
+        key = (epoch, path, "", "")
         entry = None
         remaining = self.cache.expires_in(key)
         if remaining is not None and remaining >= min_ttl:
             entry = self.cache.get(key)
         if entry is None:
-            entry, nbytes = self._query_listing(path, "", "")
+            entry, nbytes = self._query_listing(path, "", "", epoch)
             self.cache.put(key, entry, nbytes)
         table = entry["table"]
         dirs = table.filter(pc.equal(table.column("element_type"), "DIR"))
@@ -601,7 +746,7 @@ class ListingService:
         order = "descending" if order in ("desc", "descending") else "ascending"
         page_size = self.clamp_page_size(page_size)
 
-        entry = self._base_listing(
+        entry, from_cache = self._base_listing(
             path, type_filter if type_filter != "all" else "", name_filter.strip()
         )
         table = entry["table"]
@@ -616,6 +761,9 @@ class ListingService:
         return {
             "path": path,
             "snapshot_hint": SNAPSHOT_HINT,
+            "catalog_snapshot": self.backend.current_epoch(),
+            "from_cache": from_cache,
+            "query_elapsed_s": entry.get("elapsed_s"),
             "total_rows": total,
             "total_dirs": counts.get("DIR", 0),
             "total_files": counts.get("FILE", 0),
@@ -637,13 +785,14 @@ class ListingService:
         """
         if not self._prefetch_pool:
             return []
+        epoch = self.backend.current_epoch()
         table = entry["table"]
         dirs = table.filter(pc.equal(table.column("element_type"), "DIR"))
         names = sorted(dirs.column("name").to_pylist())
         futures = []
         for name in names[: self.cfg.prefetch_children]:
             child = f"{path}{name}/"
-            if self.cache.get((child, "", "")) is not None:
+            if self.cache.get((epoch, child, "", "")) is not None:
                 continue
             with self._prefetch_lock:
                 if child in self._prefetch_futures:
@@ -675,7 +824,7 @@ class ListingService:
     ) -> tuple[pa.Table, bool]:
         """Full sorted table for CSV export (shares the listing cache)."""
         path = normalize_prefix(path)
-        entry = self._base_listing(
+        entry, _from_cache = self._base_listing(
             path, type_filter if type_filter != "all" else "", name_filter.strip()
         )
         order = "descending" if order in ("desc", "descending") else "ascending"
@@ -755,7 +904,8 @@ class RollupService:
         self.cache = TTLCache(cfg.cache_ttl, cfg.rollup_cache_max_bytes)
 
     def cached(self, path: str, depth: int = 1) -> dict | None:
-        return self.cache.get((normalize_prefix(path), depth))
+        epoch = self.backend.current_epoch()
+        return self.cache.get((epoch, normalize_prefix(path), depth))
 
     def compute(
         self, path: str, depth: int = 1, rows_cb: Callable[[int], None] | None = None
@@ -771,12 +921,19 @@ class RollupService:
         if rows_cb:
             rows_cb(0)
         t0 = time.monotonic()
+        # One epoch for the whole rollup: the subtree scan and the child-dir
+        # seed then read the same catalog snapshot, and the result is cached
+        # under the epoch it actually describes.
+        epoch = self.backend.current_epoch()
+        log.info("rollup start %s depth=%d (epoch %s)", prefix, depth, epoch)
         gate = self._query_gate if self._query_gate is not None else contextlib.nullcontext()
         with gate:
             if hasattr(self.backend, "rollup_groups"):
-                groups, total_rows = self.backend.rollup_groups(prefix, depth, rows_cb=rows_cb)
+                groups, total_rows = self.backend.rollup_groups(
+                    prefix, depth, rows_cb=rows_cb, epoch=epoch
+                )
             else:
-                reader = self.backend.scan_subtree_files(prefix, ROLLUP_COLUMNS)
+                reader = self.backend.scan_subtree_files(prefix, ROLLUP_COLUMNS, epoch=epoch)
                 groups = {}
                 try:
                     total_rows = aggregate_reader(
@@ -791,7 +948,9 @@ class RollupService:
                     if hasattr(reader, "close"):
                         reader.close()
             # Seed immediate child directories, so empty folders still show up.
-            dirs = self.backend.list_child_dirs(prefix, limit=self.cfg.rollup_max_groups + 1)
+            dirs = self.backend.list_child_dirs(
+                prefix, limit=self.cfg.rollup_max_groups + 1, epoch=epoch
+            )
             for name in dirs:
                 if name not in groups and len(groups) >= self.cfg.rollup_max_groups:
                     raise RollupTooWideError(
@@ -803,6 +962,15 @@ class RollupService:
         if rows_cb:
             rows_cb(total_rows)
         elapsed = time.monotonic() - t0
+        log.info(
+            "rollup %s depth=%d: %d rows, %d groups in %.2fs (epoch %s)",
+            prefix,
+            depth,
+            total_rows,
+            len(groups),
+            elapsed,
+            epoch,
+        )
 
         children = [
             {
@@ -820,6 +988,7 @@ class RollupService:
         totals = _fold(groups)
         result = {
             "path": prefix,
+            "catalog_snapshot": epoch,
             "computed_at": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": round(elapsed, 2),
             "rows_scanned": total_rows,
@@ -832,7 +1001,7 @@ class RollupService:
                 "last_modified": ns_to_iso(totals.mtime_ns),
             },
         }
-        self.cache.put((prefix, depth), result, nbytes=_deep_size(result))
+        self.cache.put((epoch, prefix, depth), result, nbytes=_deep_size(result))
         return result
 
     def public_result(self, result: dict, child_limit: int | None = None) -> dict:

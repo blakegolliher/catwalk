@@ -28,12 +28,27 @@ def test_health(client):
     assert body["mode"] == "mock"
     assert body["catalog_reachable"] is True
     assert body["warmer"] is None  # no warm paths configured
+    assert set(body["caches"]) == {"control", "listings", "rollups"}
+    for stats in body["caches"].values():
+        assert {"entries", "bytes", "hits", "misses", "coalesced", "expired", "evicted"} <= set(
+            stats
+        )
 
 
 def test_views_served_from_mock(client):
     body = client.get("/api/views").json()
     assert body["vms_unavailable"] is False
     assert {v["name"] for v in body["views"]} == {"bench", "projects", "home"}
+
+
+def test_ls_reports_timing_and_cache_state(client):
+    r1 = client.get("/api/ls", params={"path": "/home/carol"})
+    assert "X-Catwalk-Elapsed" in r1.headers
+    body1 = r1.json()
+    assert body1["from_cache"] is False
+    assert body1["query_elapsed_s"] is not None
+    body2 = client.get("/api/ls", params={"path": "/home/carol"}).json()
+    assert body2["from_cache"] is True
 
 
 def test_ls(client):
@@ -123,6 +138,27 @@ def test_export_rollup_requires_prior_compute(client):
     r = client.get("/api/export/rollup", params={"path": "/home/dave"})
     assert r.status_code == 200
     assert r.text.splitlines()[0].startswith('"folder"')
+
+
+def test_capacity_responses_are_cached(client):
+    from catwalk.app import _state
+
+    calls = []
+
+    class CountingVMS:
+        def get_capacity(self, path):
+            calls.append(path)
+            return {"available": False, "reason": "stub"}
+
+    real = _state["vms"]
+    _state["vms"] = CountingVMS()
+    try:
+        first = client.get("/api/capacity", params={"path": "/cache-probe"}).json()
+        second = client.get("/api/capacity", params={"path": "/cache-probe"}).json()
+    finally:
+        _state["vms"] = real
+    assert first == second == {"available": False, "reason": "stub"}
+    assert calls == ["/cache-probe"]
 
 
 def test_capacity_degrades_without_vms(client):

@@ -10,6 +10,7 @@ so the event loop stays responsive, with one process-wide query budget.
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import tempfile
 import threading
@@ -27,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .cache import TTLCache
 from .catalog import SNAPSHOT_HINT, ListingService, RollupService, make_backend, normalize_prefix
 from .config import load_config
 from .jobs import JobManager, JobQueueFullError
@@ -36,9 +38,30 @@ from .warmer import CacheWarmer
 
 _state: dict = {}
 
+_access_log = logging.getLogger("catwalk.http")
+
+
+def _configure_logging():
+    """Timestamped, thread-tagged lines for every catwalk.* logger.
+
+    uvicorn only configures its own loggers; without this, catwalk's INFO
+    lines (query timing, warm passes, epoch flips) would go nowhere. The
+    thread name distinguishes interactive requests from prefetch/warmer/
+    rollup work in the same log."""
+    root = logging.getLogger("catwalk")
+    if root.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname).1s %(name)s [%(threadName)s] %(message)s")
+    )
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    _configure_logging()
     cfg = load_config()
     _state["cfg"] = cfg
     # query_gate is the real backend budget (max concurrent catalog queries).
@@ -53,6 +76,9 @@ async def _lifespan(app: FastAPI):
     _state["ctl_limiter"] = anyio.CapacityLimiter(4)
     _state["query_gate"] = threading.BoundedSemaphore(cfg.query_threads)
     _state["vms"] = VMSService(cfg)
+    # Control-plane cache (views, capacity): VMS answers are cheap but not
+    # free, and the UI re-asks on every navigation. 60s staleness is fine.
+    _state["ctl_cache"] = TTLCache(60.0)
     _state["jobs"] = JobManager(max_workers=cfg.rollup_workers, max_queue=cfg.rollup_queue_max)
     _state["backend"] = None
     _state["backend_error"] = None
@@ -94,6 +120,29 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Catwalk", docs_url=None, redoc_url=None, lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _timed_access_log(request, call_next):
+    """Replace uvicorn's untimed access log (the CLI disables it) with one
+    line per API request including wall-clock duration, and stamp the same
+    number on the response for curl/automation."""
+    t0 = time.monotonic()
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        elapsed = time.monotonic() - t0
+        response.headers["X-Catwalk-Elapsed"] = f"{elapsed:.3f}"
+        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        client = request.client.host if request.client else "-"
+        _access_log.info(
+            "%s %s %s -> %d in %.3fs",
+            client,
+            request.method,
+            target,
+            response.status_code,
+            elapsed,
+        )
+    return response
 
 
 async def _run(fn, *args, **kwargs):
@@ -153,11 +202,12 @@ async def api_views():
     cfg = _state["cfg"]
     if cfg.mock and _state["backend"] is not None:
         return {"views": _state["backend"].get_views(), "vms_unavailable": False}
-    cached = _state.get("views_cache")
-    if cached and time.monotonic() - cached[1] < 60:
-        return cached[0]
+    cache: TTLCache = _state["ctl_cache"]
+    cached = cache.get(("views",))
+    if cached is not None:
+        return cached
     result = await _run_ctl(_state["vms"].get_views)
-    _state["views_cache"] = (result, time.monotonic())
+    cache.put(("views",), result)
     return result
 
 
@@ -268,7 +318,16 @@ async def api_rollup_cancel(job_id: str, cancel_token: str = Query(..., min_leng
 
 @app.get("/api/capacity")
 async def api_capacity(path: str = Query(..., min_length=1)):
-    return await _run_ctl(_state["vms"].get_capacity, path)
+    cache: TTLCache = _state["ctl_cache"]
+    key = ("capacity", path)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    # Failures ("VMS unreachable") are cached too: a down VMS should not be
+    # re-probed on every panel refresh.
+    result = await _run_ctl(_state["vms"].get_capacity, path)
+    cache.put(key, result)
+    return result
 
 
 # ---- CSV export -------------------------------------------------------------
@@ -397,19 +456,28 @@ async def api_health():
             backend_health = {
                 "vastdb": "error: health probe timed out",
                 "catalog_reachable": False,
+                # The probe drowned, but the pinned epoch is known locally --
+                # report it so a busy cluster doesn't read as "pinning broken".
+                "catalog_snapshot": _state["backend"].peek_epoch(),
             }
     if cfg.mock:
         vms_health = "mock"
     else:
         vms_health = await _probe(_state["vms"].health) or "error: health probe timed out"
     warmer = _state.get("warmer")
+    caches = {"control": _state["ctl_cache"].stats()}
+    if _state["backend"] is not None:
+        caches["listings"] = _state["listings"].cache.stats()
+        caches["rollups"] = _state["rollups"].cache.stats()
     return {
         "vastdb": backend_health.get("vastdb"),
         "catalog_reachable": backend_health.get("catalog_reachable", False),
         "vms": vms_health,
         "mode": "mock" if cfg.mock else "vastdb",
         "snapshot_hint": SNAPSHOT_HINT,
+        "catalog_snapshot": backend_health.get("catalog_snapshot"),
         "warmer": warmer.stats() if warmer and warmer.enabled else None,
+        "caches": caches,
     }
 
 

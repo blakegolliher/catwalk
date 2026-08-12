@@ -255,7 +255,8 @@ def cmd_run(argv: list[str]) -> int:
 
     import uvicorn
 
-    uvicorn.run("catwalk.app:app", host=cfg.host, port=cfg.port)
+    # access_log off: the app logs its own per-request lines with durations.
+    uvicorn.run("catwalk.app:app", host=cfg.host, port=cfg.port, access_log=False)
     return 0
 
 
