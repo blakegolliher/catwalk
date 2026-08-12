@@ -5,17 +5,17 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
+from mock_catalog import MockBackend
 
 from catwalk.catalog import (
     FolderStats,
     RollupService,
-    RollupTooWide,
+    RollupTooWideError,
     VastBackend,
     aggregate_reader,
     merge_groups,
 )
 from catwalk.config import Config
-from mock_catalog import MockBackend
 
 
 def make_batch(rows):
@@ -95,7 +95,7 @@ def test_aggregate_reader_enforces_group_limit():
             ("/x/b/", 1, 1, 1, 1),
         ]
     )
-    with pytest.raises(RollupTooWide):
+    with pytest.raises(RollupTooWideError):
         aggregate_reader([batch], "/x/", 1, {}, max_groups=1)
 
 

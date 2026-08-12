@@ -16,7 +16,7 @@ dependencies = [
     "vastpy>=0.3,<1",
     "pyarrow>=14,<24",
     "numpy>=1.24,<3",
-    "anyio>=3.7,<5",
+    "anyio>=4,<5",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +43,7 @@ testpaths = ["tests"]
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "B", "SIM"]
+select = ["E", "F", "W", "B", "SIM", "I", "UP", "C4", "PIE", "RUF", "N"]
 
 [tool.ruff.lint.per-file-ignores]
 # Verbatim /proc/net/tcp fixture lines cannot be wrapped.

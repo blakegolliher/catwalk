@@ -110,6 +110,7 @@ def test_export_filename_supports_unicode_paths(client):
 
 def test_spreadsheet_formula_strings_are_neutralized():
     import pyarrow as pa
+
     from catwalk.app import _spreadsheet_safe
 
     table = _spreadsheet_safe(pa.table({"name": ["=1+1", "+cmd", "safe"]}))

@@ -16,7 +16,8 @@ import logging
 import sys
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 
@@ -71,7 +72,7 @@ _PREFETCH_JOIN_TIMEOUT_S = 15.0
 log = logging.getLogger("catwalk.catalog")
 
 
-class RollupTooWide(RuntimeError):
+class RollupTooWideError(RuntimeError):
     """The requested grouping would create an unsafe in-memory result."""
 
     status_code = 413
@@ -86,7 +87,7 @@ def normalize_prefix(path: str) -> str:
     return path if path == "/" else path + "/"
 
 
-def ns_to_iso(ns) -> str:
+def ns_to_iso(ns: int | None) -> str:
     """int64 epoch-nanoseconds -> ISO-8601 UTC string with nanosecond precision."""
     if ns is None:
         return ""
@@ -100,7 +101,7 @@ def group_key(parent_path: str, prefix: str, depth: int) -> str:
     return "/".join(parts[:depth]) if parts else "."
 
 
-def newest(current_ns, candidate_ns):
+def newest(current_ns: int | None, candidate_ns: int | None) -> int | None:
     if current_ns is None:
         return candidate_ns
     if candidate_ns is None:
@@ -111,7 +112,7 @@ def newest(current_ns, candidate_ns):
 class FolderStats:
     """Running totals for one folder group."""
 
-    __slots__ = ("files", "bytes", "used", "mtime_ns", "atime_ns")
+    __slots__ = ("atime_ns", "bytes", "files", "mtime_ns", "used")
 
     def __init__(self):
         self.files = 0
@@ -120,7 +121,14 @@ class FolderStats:
         self.mtime_ns = None
         self.atime_ns = None
 
-    def add(self, files, nbytes, used, mtime_ns, atime_ns):
+    def add(
+        self,
+        files: int,
+        nbytes: int | None,
+        used: int | None,
+        mtime_ns: int | None,
+        atime_ns: int | None,
+    ) -> None:
         self.files += files
         self.bytes += nbytes or 0
         self.used += used or 0
@@ -128,7 +136,14 @@ class FolderStats:
         self.atime_ns = newest(self.atime_ns, atime_ns)
 
 
-def aggregate_reader(reader, prefix, depth, groups, rows_cb=None, max_groups=0):
+def aggregate_reader(
+    reader: Iterable[pa.RecordBatch],
+    prefix: str,
+    depth: int,
+    groups: dict[str, FolderStats],
+    rows_cb: Callable[[int], None] | None = None,
+    max_groups: int = 0,
+) -> int:
     """Consume RecordBatches, folding rows into per-group FolderStats.
 
     Each batch is grouped with pyarrow (vectorized); only the per-batch group
@@ -170,7 +185,7 @@ def aggregate_reader(reader, prefix, depth, groups, rows_cb=None, max_groups=0):
         for row in summary.to_pylist():
             key = row["key"]
             if key not in groups and max_groups and len(groups) >= max_groups:
-                raise RollupTooWide(
+                raise RollupTooWideError(
                     f"rollup exceeds CATWALK_ROLLUP_MAX_GROUPS={max_groups}; "
                     "use a smaller depth or a narrower path"
                 )
@@ -187,10 +202,14 @@ def aggregate_reader(reader, prefix, depth, groups, rows_cb=None, max_groups=0):
     return rows
 
 
-def merge_groups(groups, partial, max_groups=0):
+def merge_groups(
+    groups: dict[str, FolderStats],
+    partial: dict[str, FolderStats],
+    max_groups: int = 0,
+) -> None:
     for key, stats in partial.items():
         if key not in groups and max_groups and len(groups) >= max_groups:
-            raise RollupTooWide(
+            raise RollupTooWideError(
                 f"rollup exceeds CATWALK_ROLLUP_MAX_GROUPS={max_groups}; "
                 "use a smaller depth or a narrower path"
             )
@@ -240,16 +259,29 @@ class VastBackend:
         # SDK concurrency == len(data_endpoints): repeat VIPs to hit the
         # configured concurrency instead of being capped at the VIP count.
         self.fanout = cfg.fanout_endpoints()
+        # Without a timeout the SDK's requests block forever on a black-holed
+        # VIP, permanently pinning a slot of the shared query budget. The
+        # timeout is per socket read, so long streaming scans that keep
+        # delivering batches are unaffected.
         self.session = vastdb.connect(
-            endpoint=cfg.endpoint, access=cfg.access_key, secret=cfg.secret_key
+            endpoint=cfg.endpoint,
+            access=cfg.access_key,
+            secret=cfg.secret_key,
+            timeout=cfg.query_timeout or None,
         )
 
-    def _query_config(self, num_splits=None):
+    def _query_config(self, num_splits: int | None = None):
         from vastdb.config import QueryConfig
 
         return QueryConfig(data_endpoints=self.fanout, num_splits=num_splits or self.cfg.num_splits)
 
-    def list_dir(self, path, columns, element_type=None, name_contains=None):
+    def list_dir(
+        self,
+        path: str,
+        columns: list[str],
+        element_type: str | None = None,
+        name_contains: str | None = None,
+    ) -> Iterator[pa.RecordBatch]:
         """Yield RecordBatches for one directory (equality on parent_path).
 
         The name filter is pushed into the predicate when the SDK supports
@@ -280,7 +312,9 @@ class VastBackend:
         yield first
         yield from gen
 
-    def _run(self, predicate, columns, client_name_filter):
+    def _run(
+        self, predicate, columns: list[str], client_name_filter: str | None
+    ) -> Iterator[pa.RecordBatch]:
         with self.session.transaction() as tx:
             reader = tx.catalog().select(
                 columns=columns, predicate=predicate, config=self._query_config()
@@ -292,7 +326,7 @@ class VastBackend:
                 if batch.num_rows:
                     yield batch
 
-    def scan_subtree_files(self, prefix, columns):
+    def scan_subtree_files(self, prefix: str, columns: list[str]) -> Iterator[pa.RecordBatch]:
         """Yield RecordBatches of every FILE row under prefix (recursive)."""
         from ibis import _
 
@@ -304,7 +338,9 @@ class VastBackend:
             )
             yield from reader
 
-    def rollup_groups(self, prefix, depth, rows_cb=None):
+    def rollup_groups(
+        self, prefix: str, depth: int, rows_cb: Callable[[int], None] | None = None
+    ) -> tuple[dict[str, FolderStats], int]:
         """Pipelined rollup: one select() stream (the SDK fans fetching out
         across the duplicated endpoint list), consumed through a bounded set
         of aggregation futures so transport and per-batch group_by overlap.
@@ -361,7 +397,7 @@ class VastBackend:
             pool.shutdown(wait=True, cancel_futures=True)
         return groups, total
 
-    def list_child_dirs(self, path, limit=None):
+    def list_child_dirs(self, path: str, limit: int | None = None) -> list[str]:
         from ibis import _
 
         with self.session.transaction() as tx:
@@ -377,7 +413,7 @@ class VastBackend:
             )
         return dirs.column("name").to_pylist()
 
-    def health(self):
+    def health(self) -> dict:
         from ibis import _
 
         try:
@@ -418,21 +454,23 @@ class ListingService:
             if cfg.prefetch_children > 0
             else None
         )
-        self._prefetch_futures: dict[str, object] = {}
+        self._prefetch_futures: dict[str, Future] = {}
         self._prefetch_lock = threading.Lock()
 
-    def close(self):
+    def close(self) -> None:
         if self._prefetch_pool:
             self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
 
-    def clamp_page_size(self, page_size) -> int:
+    def clamp_page_size(self, page_size: int | None) -> int:
         requested = self.cfg.page_default if page_size is None else int(page_size)
         return max(20, min(self.cfg.page_max, requested))
 
     def _query_context(self):
         return self._query_gate if self._query_gate is not None else contextlib.nullcontext()
 
-    def _base_listing(self, path, type_filter, name_filter, _join_prefetch=True):
+    def _base_listing(
+        self, path: str, type_filter: str, name_filter: str, _join_prefetch: bool = True
+    ) -> dict:
         """Cached (table, truncated) for one directory + filters."""
         key = (path, type_filter or "", name_filter or "")
 
@@ -482,7 +520,7 @@ class ListingService:
         entry, _hit = self.cache.get_or_compute(key, compute)
         return entry
 
-    def _query_listing(self, path, type_filter, name_filter):
+    def _query_listing(self, path: str, type_filter: str, name_filter: str) -> tuple[dict, int]:
         """Run the backend query for one listing; returns (entry, nbytes)."""
         element_type = {"file": "FILE", "dir": "DIR", "other": "OTHER"}.get(type_filter)
         batches, rows, truncated = [], 0, False
@@ -508,7 +546,7 @@ class ListingService:
             table = _empty_listing_table()
         return _listing_entry(table, truncated), _listing_cost(table)
 
-    def warm_listing(self, path, min_ttl=0.0):
+    def warm_listing(self, path: str, min_ttl: float = 0.0) -> list[str]:
         """Ensure the unfiltered listing of path is cached with at least
         min_ttl seconds of life left; re-query it otherwise. Returns the
         child directory names (the BFS frontier for the cache warmer).
@@ -529,7 +567,7 @@ class ListingService:
         dirs = table.filter(pc.equal(table.column("element_type"), "DIR"))
         return dirs.column("name").to_pylist()
 
-    def _sorted_table(self, entry, sort, order):
+    def _sorted_table(self, entry: dict, sort: str, order: str) -> pa.Table:
         skey = (sort, order)
         with entry["sort_lock"]:
             cached = entry["sorted"].get(skey)
@@ -549,14 +587,14 @@ class ListingService:
 
     def list_page(
         self,
-        path,
-        page=1,
-        page_size=None,
-        sort="name",
-        order="asc",
-        type_filter="all",
-        name_filter="",
-    ):
+        path: str,
+        page: int = 1,
+        page_size: int | None = None,
+        sort: str = "name",
+        order: str = "asc",
+        type_filter: str = "all",
+        name_filter: str = "",
+    ) -> dict:
         path = normalize_prefix(path)
         if sort not in SORT_KEYS:
             sort = "name"
@@ -589,7 +627,7 @@ class ListingService:
             "entries": _entries_json(window),
         }
 
-    def prefetch_children(self, path, entry):
+    def prefetch_children(self, path: str, entry: dict) -> list[Future]:
         """Warm the listing cache for this directory's first child dirs.
 
         Fire-and-forget: a click on a child then serves from cache. Cached
@@ -616,18 +654,25 @@ class ListingService:
             futures.append(fut)
         return futures
 
-    def _prefetch_one(self, child):
+    def _prefetch_one(self, child: str) -> None:
         # Speculative work is intentionally silent; an interactive request
         # retries the query and reports any failure.
         with contextlib.suppress(Exception):
             self._base_listing(child, "", "", _join_prefetch=False)
 
-    def _forget_prefetch(self, child, future):
+    def _forget_prefetch(self, child: str, future: Future) -> None:
         with self._prefetch_lock:
             if self._prefetch_futures.get(child) is future:
                 self._prefetch_futures.pop(child, None)
 
-    def listing_table(self, path, sort="name", order="asc", type_filter="all", name_filter=""):
+    def listing_table(
+        self,
+        path: str,
+        sort: str = "name",
+        order: str = "asc",
+        type_filter: str = "all",
+        name_filter: str = "",
+    ) -> tuple[pa.Table, bool]:
         """Full sorted table for CSV export (shares the listing cache)."""
         path = normalize_prefix(path)
         entry = self._base_listing(
@@ -643,16 +688,16 @@ def _empty_listing_table() -> pa.Table:
     return pa.table({f.name: pa.array([], f.type) for f in SCHEMA if f.name in LISTING_COLUMNS})
 
 
-def _listing_entry(table, truncated):
+def _listing_entry(table: pa.Table, truncated: bool) -> dict:
     return {"table": table, "truncated": truncated, "sorted": {}, "sort_lock": threading.Lock()}
 
 
-def _listing_cost(table):
+def _listing_cost(table: pa.Table) -> int:
     # Base table plus the maximum number of independently allocated sorts.
     return max(1024, table.nbytes * (1 + _MAX_SORT_VARIANTS))
 
 
-def _filter_listing_type(table, type_filter):
+def _filter_listing_type(table: pa.Table, type_filter: str) -> pa.Table:
     element_type = table.column("element_type")
     if type_filter == "other":
         return table.filter(pc.invert(pc.is_in(element_type, value_set=pa.array(["FILE", "DIR"]))))
@@ -709,10 +754,12 @@ class RollupService:
         self._query_gate = query_gate
         self.cache = TTLCache(cfg.cache_ttl, cfg.rollup_cache_max_bytes)
 
-    def cached(self, path, depth=1):
+    def cached(self, path: str, depth: int = 1) -> dict | None:
         return self.cache.get((normalize_prefix(path), depth))
 
-    def compute(self, path, depth=1, rows_cb=None):
+    def compute(
+        self, path: str, depth: int = 1, rows_cb: Callable[[int], None] | None = None
+    ) -> dict:
         prefix = normalize_prefix(path)
         if depth < 1 or depth > self.cfg.rollup_max_depth:
             raise ValueError(f"rollup depth must be between 1 and {self.cfg.rollup_max_depth}")
@@ -747,7 +794,7 @@ class RollupService:
             dirs = self.backend.list_child_dirs(prefix, limit=self.cfg.rollup_max_groups + 1)
             for name in dirs:
                 if name not in groups and len(groups) >= self.cfg.rollup_max_groups:
-                    raise RollupTooWide(
+                    raise RollupTooWideError(
                         "rollup exceeds "
                         f"CATWALK_ROLLUP_MAX_GROUPS={self.cfg.rollup_max_groups}; "
                         "use a narrower path"
@@ -788,7 +835,7 @@ class RollupService:
         self.cache.put((prefix, depth), result, nbytes=_deep_size(result))
         return result
 
-    def public_result(self, result, child_limit=None):
+    def public_result(self, result: dict, child_limit: int | None = None) -> dict:
         """Return an API-sized copy while retaining the full cached export."""
         limit = child_limit or self.cfg.rollup_response_children
         limit = min(limit, self.cfg.rollup_max_groups)

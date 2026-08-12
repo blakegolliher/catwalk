@@ -10,8 +10,9 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
-from typing import Any, Callable, Hashable
+from typing import Any
 
 
 @dataclass

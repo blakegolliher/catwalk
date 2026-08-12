@@ -1,10 +1,10 @@
 """Listing service: slicing, clamping, truncation, cache behaviour."""
 
 import pytest
+from mock_catalog import MockBackend
 
 from catwalk.catalog import ListingService
 from catwalk.config import Config
-from mock_catalog import MockBackend
 
 
 class CountingBackend(MockBackend):

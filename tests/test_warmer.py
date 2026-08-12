@@ -1,9 +1,10 @@
 """Cache warmer: BFS depth, dir cap, TTL-aware refresh."""
 
+from mock_catalog import MockBackend
+
 from catwalk.catalog import ListingService
 from catwalk.config import Config
 from catwalk.warmer import CacheWarmer
-from mock_catalog import MockBackend
 
 
 class CountingBackend(MockBackend):

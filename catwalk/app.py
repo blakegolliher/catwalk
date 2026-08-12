@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .catalog import SNAPSHOT_HINT, ListingService, RollupService, make_backend, normalize_prefix
 from .config import load_config
-from .jobs import JobManager, JobQueueFull
+from .jobs import JobManager, JobQueueFullError
 from .netinfo import report_listening
 from .vms import VMSService
 from .warmer import CacheWarmer
@@ -41,7 +41,16 @@ _state: dict = {}
 async def _lifespan(app: FastAPI):
     cfg = load_config()
     _state["cfg"] = cfg
-    _state["limiter"] = anyio.CapacityLimiter(cfg.query_threads)
+    # query_gate is the real backend budget (max concurrent catalog queries).
+    # The limiter only bounds request worker threads and is deliberately
+    # larger: a request holds its limiter slot *while waiting* for the gate,
+    # and background work (warmer/prefetch/rollups) also feeds the gate — a
+    # limiter the same size as the gate would let gate-blocked cold queries
+    # starve cache hits, which never need the gate at all.
+    _state["limiter"] = anyio.CapacityLimiter(cfg.query_threads + 16)
+    # Control-plane calls (health/views/capacity) get their own small lane so
+    # they stay answerable while every data slot is busy or wedged.
+    _state["ctl_limiter"] = anyio.CapacityLimiter(4)
     _state["query_gate"] = threading.BoundedSemaphore(cfg.query_threads)
     _state["vms"] = VMSService(cfg)
     _state["jobs"] = JobManager(max_workers=cfg.rollup_workers, max_queue=cfg.rollup_queue_max)
@@ -93,6 +102,26 @@ async def _run(fn, *args, **kwargs):
     )
 
 
+async def _run_ctl(fn, *args, **kwargs):
+    """Control-plane variant of _run: does not compete with data queries."""
+    return await anyio.to_thread.run_sync(
+        functools.partial(fn, *args, **kwargs), limiter=_state["ctl_limiter"]
+    )
+
+
+async def _probe(fn, timeout_s: float = 5.0):
+    """Bounded health probe: returns None instead of hanging on a wedged
+    backend. On timeout the worker thread is abandoned (it cannot be killed);
+    it exits when the underlying call's own network timeout fires."""
+    try:
+        with anyio.fail_after(timeout_s):
+            return await anyio.to_thread.run_sync(
+                fn, limiter=_state["ctl_limiter"], abandon_on_cancel=True
+            )
+    except TimeoutError:
+        return None
+
+
 async def _wait_job(job, timeout: float) -> bool:
     """Wait without occupying a worker-thread slot needed by real queries."""
     deadline = time.monotonic() + timeout
@@ -127,7 +156,7 @@ async def api_views():
     cached = _state.get("views_cache")
     if cached and time.monotonic() - cached[1] < 60:
         return cached[0]
-    result = await _run(_state["vms"].get_views)
+    result = await _run_ctl(_state["vms"].get_views)
     _state["views_cache"] = (result, time.monotonic())
     return result
 
@@ -192,7 +221,7 @@ async def api_rollup(
         job, cancel_token = jobs.submit(
             ("rollup", prefix, depth), lambda cb: rollups.compute(prefix, depth, rows_cb=cb)
         )
-    except JobQueueFull as e:
+    except JobQueueFullError as e:
         raise HTTPException(429, str(e), headers={"Retry-After": "2"}) from e
     finished = await _wait_job(job, cfg.rollup_sync_timeout)
     if finished:
@@ -239,7 +268,7 @@ async def api_rollup_cancel(job_id: str, cancel_token: str = Query(..., min_leng
 
 @app.get("/api/capacity")
 async def api_capacity(path: str = Query(..., min_length=1)):
-    return await _run(_state["vms"].get_capacity, path)
+    return await _run_ctl(_state["vms"].get_capacity, path)
 
 
 # ---- CSV export -------------------------------------------------------------
@@ -363,8 +392,16 @@ async def api_health():
     if _state["backend"] is None:
         backend_health = {"vastdb": f"error: {_state['backend_error']}", "catalog_reachable": False}
     else:
-        backend_health = await _run(_state["backend"].health)
-    vms_health = "mock" if cfg.mock else await _run(_state["vms"].health)
+        backend_health = await _probe(_state["backend"].health)
+        if backend_health is None:
+            backend_health = {
+                "vastdb": "error: health probe timed out",
+                "catalog_reachable": False,
+            }
+    if cfg.mock:
+        vms_health = "mock"
+    else:
+        vms_health = await _probe(_state["vms"].health) or "error: health probe timed out"
     warmer = _state.get("warmer")
     return {
         "vastdb": backend_health.get("vastdb"),

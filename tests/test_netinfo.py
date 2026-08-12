@@ -79,7 +79,7 @@ def test_report_waits_for_bind_then_prints():
 
 
 def test_report_fallback_formats_ipv6(monkeypatch):
-    monkeypatch.setattr(netinfo, "listening_sockets", lambda: [])
+    monkeypatch.setattr(netinfo, "listening_sockets", list)
     msgs = []
     thread = netinfo.report_listening("::1", 8080, deadline=0, out=msgs.append)
     thread.join(timeout=1)

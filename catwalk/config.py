@@ -69,6 +69,7 @@ class Config:
     rollup_response_children: int = 500
     query_threads: int = 8
     query_concurrency: int = 24
+    query_timeout: float = 60.0  # per-read socket timeout; 0 disables
     prefetch_children: int = 8
     warm_paths: list[str] | None = None
     warm_depth: int = 2
@@ -76,7 +77,7 @@ class Config:
     warm_max_dirs: int = 500
     warm_interval: float = 0.0  # 0 -> derived: cache_ttl * 0.75
 
-    def validate(self) -> "Config":
+    def validate(self) -> Config:
         """Reject settings that would crash startup or defeat resource bounds."""
         errors = []
 
@@ -120,6 +121,7 @@ class Config:
             )
         integer("CATWALK_QUERY_THREADS", self.query_threads, 1, 128)
         integer("CATWALK_QUERY_CONCURRENCY", self.query_concurrency, 0, 256)
+        number("CATWALK_QUERY_TIMEOUT", self.query_timeout, allow_zero=True)
         integer("CATWALK_PREFETCH_CHILDREN", self.prefetch_children, 0)
         integer("CATWALK_WARM_DEPTH", self.warm_depth, 0)
         integer("CATWALK_WARM_THREADS", self.warm_threads, 1, 64)
@@ -210,6 +212,7 @@ def load_config() -> Config:
         rollup_response_children=_env_num("CATWALK_ROLLUP_RESPONSE_CHILDREN", int, 500),
         query_threads=_env_num("CATWALK_QUERY_THREADS", int, 8),
         query_concurrency=_env_num("CATWALK_QUERY_CONCURRENCY", int, 24),
+        query_timeout=_env_num("CATWALK_QUERY_TIMEOUT", float, 60.0),
         prefetch_children=_env_num("CATWALK_PREFETCH_CHILDREN", int, 8),
         warm_paths=[p.strip() for p in warm.split(",") if p.strip()] if warm else None,
         warm_depth=_env_num("CATWALK_WARM_DEPTH", int, 2),

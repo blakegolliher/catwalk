@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from zlib import crc32
 
 import numpy as np
@@ -182,7 +183,13 @@ class MockBackend:
     def __init__(self):
         self.catalog = MockCatalog()
 
-    def list_dir(self, path, columns, element_type=None, name_contains=None):
+    def list_dir(
+        self,
+        path: str,
+        columns: list[str],
+        element_type: str | None = None,
+        name_contains: str | None = None,
+    ) -> Iterator[pa.RecordBatch]:
         if path not in self.catalog.tree:
             return
         tbl = self.catalog._dir_table(path)
@@ -196,7 +203,7 @@ class MockBackend:
             tbl = tbl.filter(pc.match_substring(tbl.column("name"), name_contains))
         yield from tbl.select(columns).to_batches(max_chunksize=BATCH_ROWS)
 
-    def scan_subtree_files(self, prefix, columns):
+    def scan_subtree_files(self, prefix: str, columns: list[str]) -> Iterator[pa.RecordBatch]:
         for path in sorted(self.catalog.tree):
             if not path.startswith(prefix):
                 continue
@@ -205,13 +212,13 @@ class MockBackend:
             if tbl.num_rows:
                 yield from tbl.select(columns).to_batches(max_chunksize=BATCH_ROWS)
 
-    def list_child_dirs(self, path, limit=None):
+    def list_child_dirs(self, path: str, limit: int | None = None) -> list[str]:
         spec = self.catalog.tree.get(path)
         dirs = list(spec["dirs"]) if spec else []
         return dirs[:limit] if limit is not None else dirs
 
-    def health(self):
+    def health(self) -> dict:
         return {"vastdb": "ok", "catalog_reachable": True, "mode": "mock"}
 
-    def get_views(self):
+    def get_views(self) -> list[dict]:
         return [dict(v) for v in MOCK_VIEWS]

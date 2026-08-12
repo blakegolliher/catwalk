@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from catwalk.jobs import JobManager, JobQueueFull
+from catwalk.jobs import JobManager, JobQueueFullError
 
 
 def test_queue_is_bounded_and_queued_job_can_be_cancelled():
@@ -22,7 +22,7 @@ def test_queue_is_bounded_and_queued_job_can_be_cancelled():
     assert started.wait(1)
     second, _ = manager.submit(("second",), lambda _progress: {"ok": True})
     assert second.status == "queued"
-    with pytest.raises(JobQueueFull):
+    with pytest.raises(JobQueueFullError):
         manager.submit(("third",), lambda _progress: {})
 
     manager.cancel(second.id)

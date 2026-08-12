@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 _DONE_RETENTION_SECS = 300.0
 
 
-class JobQueueFull(RuntimeError):
+class JobQueueFullError(RuntimeError):
     """Raised instead of allowing an unbounded executor backlog."""
 
 
-class JobCancelled(RuntimeError):
+class JobCancelledError(RuntimeError):
     status_code = 409
 
 
@@ -82,7 +82,7 @@ class JobManager:
                 existing.watchers.add(watcher)
                 return existing, watcher
             if not self._slots.acquire(blocking=False):
-                raise JobQueueFull("rollup queue is full; retry after active scans finish")
+                raise JobQueueFullError("rollup queue is full; retry after active scans finish")
 
             job = Job(id=uuid.uuid4().hex[:12], key=key, watchers={watcher})
             self._jobs[job.id] = job
@@ -90,7 +90,7 @@ class JobManager:
 
             def progress(rows):
                 if job.cancel_requested.is_set():
-                    raise JobCancelled("rollup cancelled")
+                    raise JobCancelledError("rollup cancelled")
                 job.rows_scanned = rows
 
             def run():
@@ -99,12 +99,12 @@ class JobManager:
                 final_status = "done"
                 try:
                     if job.cancel_requested.is_set():
-                        raise JobCancelled("rollup cancelled")
+                        raise JobCancelledError("rollup cancelled")
                     result = fn(progress)
                     if job.cancel_requested.is_set():
-                        raise JobCancelled("rollup cancelled")
+                        raise JobCancelledError("rollup cancelled")
                     job.result = result
-                except JobCancelled as e:
+                except JobCancelledError as e:
                     job.error = str(e)
                     job.error_status = e.status_code
                     final_status = "cancelled"
