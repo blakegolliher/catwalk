@@ -3,23 +3,21 @@
 Catwalk is a web-based file browser for the **VAST Catalog** — the queryable,
 snapshot-indexed metadata table of every file, directory, and object on a VAST
 cluster. Instead of walking the filesystem over NFS/S3 (slow, invasive, and
-hard on the cluster), Catwalk answers everything from the Catalog's tabular
-index over the VAST DB SDK: pick a view, browse the tree, page through
-directories with millions of entries, and see per-directory space rollups
-aggregated over *all* descendants.
-
-It is a single Python process a field engineer can run on a jump host:
-`pip install`, one command, open a browser. No build step, no database server,
-no Trino. Two connection planes are used and never mixed: `vastpy` → VMS
-(HTTPS :443) for enumerating views, and `vastdb` → **data VIPs** for every
-catalog query.
+hard on the cluster), it answers everything from the Catalog's tabular index
+over the VAST DB SDK: pick a view, browse the tree, page through directories
+with millions of entries, and see per-directory space rollups aggregated over
+*all* descendants. It is a single Python process for a jump host — `pip
+install`, one command, open a browser; no build step, no database server, no
+Trino.
 
 ## Quickstart (demo / mock mode — no cluster needed)
 
 ```bash
 pip install -e .
-CATWALK_MOCK=1 uvicorn catwalk.app:app --port 8080
+catwalk start --mock        # background; prints the URLs it listens on
 # open http://localhost:8080
+catwalk status              # pid, port, /api/health summary
+catwalk stop
 ```
 
 Mock mode serves a deterministic synthetic namespace (~1M files under
@@ -32,35 +30,67 @@ touching their cluster.
 ```bash
 pip install -e .
 
+mkdir -p ~/.catwalk
+(umask 077; cat > ~/.catwalk/catwalk.env <<'EOF'
 # Data plane (required) — data VIP pool DNS name or VIP, NOT the VMS address
-export VASTDB_ENDPOINT=http://pool1.lab.vast.com
-export VASTDB_ACCESS_KEY=...
-export VASTDB_SECRET_KEY=...
-export CATWALK_AUTO_ENDPOINTS=1        # fan out across every VIP in the pool
+VASTDB_ENDPOINT=http://pool1.lab.vast.com
+VASTDB_ACCESS_KEY=...
+VASTDB_SECRET_KEY=...
+# Fan out across every VIP in the pool
+CATWALK_AUTO_ENDPOINTS=1
 
 # Control plane (optional — enables the view selector and capacity estimates)
-export VMS_ADDRESS=vms.lab.vast.com
-export VMS_USER=...
-export VMS_PASSWORD=...
+VMS_ADDRESS=vms.lab.vast.com
+VMS_USER=...
+VMS_PASSWORD=...
+EOF
+)
 
-uvicorn catwalk.app:app --host 0.0.0.0 --port 8080
-# or:  catwalk --port 8080
+catwalk start --port 8080
 ```
 
 Without VMS credentials the view selector is empty and you type paths
 directly — catalog browsing never depends on VMS.
 
-On startup Catwalk verifies its listening sockets (via `/proc`) and prints
-one URL per reachable address — a `0.0.0.0` bind (the `catwalk` launcher's
-default) is expanded to every IP assigned on the host. Note the bare
-`uvicorn` CLI defaults to `127.0.0.1`; pass `--host 0.0.0.0` (as above) or
-use the `catwalk` launcher to listen on every interface — the startup report
-tells you if you're bound to loopback only.
+## Running it
+
+`catwalk start` validates the configuration, detaches from the terminal
+(survives logout), waits for the server socket, and prints one URL per
+reachable address (a `0.0.0.0` bind — the default — is expanded via `/proc`
+to every IP assigned on the host, so the report tells you if you are bound to
+loopback only). `catwalk status` shows pid, port, uptime, and an
+`/api/health` probe (exit code 0 up / 3 down); `catwalk stop` shuts it down
+(`--force` to SIGKILL). `catwalk --help` lists per-command options.
+
+State lives in `CATWALK_STATE_DIR` (default `~/.catwalk`):
+
+    catwalk.env    optional KEY=VALUE settings, loaded by start/run
+    catwalk.json   pid, bind address, resolved port, log path, start time
+    catwalk.log    server output, appended across restarts
+
+One state dir manages one instance — to run several, give each its own
+`CATWALK_STATE_DIR`. `--port 0` picks a free port and prints it.
+
+Foreground alternatives: `catwalk run` (same flags, logs to the terminal), or
+plain `uvicorn catwalk.app:app --host 0.0.0.0 --port 8080` — note the bare
+`uvicorn` CLI defaults to `127.0.0.1` and does not read `catwalk.env`.
 
 ## Configuration
 
-Environment variables (the `catwalk` launcher accepts equivalent CLI flags,
-flags win):
+Two connection planes are used and never mixed: `vastpy` → VMS (HTTPS :443)
+for enumerating views, and `vastdb` → **data VIPs** for every catalog query.
+
+Settings come from three places; later ones win:
+
+1. **Env file** — `catwalk start`/`run` load `<CATWALK_STATE_DIR>/catwalk.env`
+   (default `~/.catwalk/catwalk.env`) if it exists, or the file given with
+   `--env-file`. Plain `KEY=VALUE` lines with the variable names below;
+   `#` comments on their own line; an optional `export ` prefix is tolerated
+   so the file can also be `source`d. Keep it `chmod 600` — it holds keys.
+2. **Environment variables** already set in the shell.
+3. **CLI flags** (`catwalk start --port 8081 ...`).
+
+Variables (the `catwalk` launcher accepts equivalent CLI flags):
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -68,8 +98,9 @@ flags win):
 | `VASTDB_ACCESS_KEY` / `VASTDB_SECRET_KEY` | — | S3 keys for the data plane |
 | `VASTDB_DATA_ENDPOINTS` | — | Explicit comma-separated VIP URLs |
 | `CATWALK_AUTO_ENDPOINTS` | off | Resolve the endpoint's A records, query across every VIP |
-| `VMS_ADDRESS` / `VMS_USER` / `VMS_PASSWORD` | — | VMS credentials (optional) |
-| `CATWALK_HOST` / `CATWALK_PORT` | `0.0.0.0` / `8080` | Bind address |
+| `VMS_ADDRESS` / `VMS_USER` / `VMS_PASSWORD` | — | VMS credentials (optional). Address is a hostname or IP (a pasted `http(s)://` URL is normalized; VMS is always reached over HTTPS :443) |
+| `CATWALK_HOST` / `CATWALK_PORT` | `0.0.0.0` / `8080` | Bind address (port `0` = pick a free port) |
+| `CATWALK_STATE_DIR` | `~/.catwalk` | Env-file/pid/log location for `catwalk start`/`stop`/`status`; one instance per dir |
 | `CATWALK_PAGE_DEFAULT` / `CATWALK_PAGE_MAX` | `20` / `100` | Page size bounds |
 | `CATWALK_CACHE_TTL` | `900` | Cache TTL seconds — align with the catalog snapshot cadence |
 | `CATWALK_LISTING_CAP` | `500000` | Max rows cached per directory listing |
@@ -77,6 +108,7 @@ flags win):
 | `CATWALK_NUM_SPLITS` | `64` | `QueryConfig.num_splits` for scans |
 | `CATWALK_QUERY_CONCURRENCY` | `24` | SDK reader threads per query (the VIP list is repeated to this length; `0` disables) |
 | `CATWALK_QUERY_THREADS` | `8` | Global high-level catalog query budget shared by interactive requests, prefetch, warming, and rollups |
+| `CATWALK_QUERY_TIMEOUT` | `60` | Per-socket-read timeout (seconds) on catalog queries, so a dead VIP cannot pin a query slot forever; `0` disables |
 | `CATWALK_PREFETCH_CHILDREN` | `8` | After a listing, warm the cache for this many child dirs in the background (`0` disables) |
 | `CATWALK_WARM_PATHS` | — | Comma-separated roots to cache-warm at startup and keep warm (e.g. `/projects,/home`; unset disables the warmer) |
 | `CATWALK_WARM_DEPTH` | `2` | Warm listings this many levels below each warm root (`0` = roots only) |
@@ -108,8 +140,10 @@ credentials:
   their tenant's VIPs, and a key replayed against another tenant's VIP gets
   `403 Forbidden` before the transaction starts.
 
-Run one Catwalk instance per tenant (different port + `.env`) to give several
-tenants a browser at once.
+Run one Catwalk instance per tenant to give several tenants a browser at
+once: give each its own `CATWALK_STATE_DIR` (holding that tenant's
+`catwalk.env` with its VIP pool, keys, and port) and `catwalk start` them
+independently.
 
 Do **not** try to filter on the catalog's `tenant_id` column: it holds
 internal ids that do not match VMS tenant ids (VMS tenant 57 can appear as
@@ -150,6 +184,10 @@ enforced by the server anyway.
   cancels obsolete asynchronous jobs. Identical concurrent rollups share one
   job; each `202` carries a per-client `cancel_token`, and the shared scan is
   only cancelled once every client has detached with its token.
+- Health, view, and capacity endpoints run on their own small thread budget
+  with a bounded probe, so `/api/health` answers even while every catalog
+  query slot is busy — and `CATWALK_QUERY_TIMEOUT` keeps a black-holed VIP
+  from pinning those slots forever.
 
 ## Performance notes (measured against a 6-VIP lab, ~840M-row catalog)
 
@@ -210,7 +248,7 @@ catalog snapshot; if a new snapshot lands between the two runs, re-run).
 | `DELETE /api/rollup/status?job_id=&cancel_token=` | Detach from a shared rollup job; cancels the scan when the last client detaches |
 | `GET /api/capacity?path=` | VMS sampled capacity estimate (best-effort) |
 | `GET /api/export/listing`, `GET /api/export/rollup` | CSV downloads |
-| `GET /api/health` | vastdb / VMS / catalog reachability |
+| `GET /api/health` | vastdb / VMS / catalog reachability; always answers, even when every query slot is busy |
 
 ## Tests
 
