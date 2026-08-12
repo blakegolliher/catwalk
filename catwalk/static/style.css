@@ -68,9 +68,17 @@ button, .btn { cursor: pointer; user-select: none; text-decoration: none; }
 button:hover, .btn:hover { background: var(--hover); }
 button:disabled { opacity: 0.4; cursor: default; }
 
-#path-input { width: 300px; font-family: ui-monospace, monospace; }
-
-.breadcrumb { font-family: ui-monospace, monospace; font-size: 13px; white-space: nowrap; overflow: hidden; }
+.breadcrumb {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  flex: 1;              /* clickable empty space doubles as "edit path" */
+  min-width: 0;
+  cursor: text;
+  padding: 5px 0;       /* match input height so edit mode doesn't jump */
+}
+.breadcrumb input { width: 100%; max-width: 480px; font-family: ui-monospace, monospace; }
 .breadcrumb a { color: var(--accent2); cursor: pointer; text-decoration: none; }
 .breadcrumb a:hover { text-decoration: underline; }
 .breadcrumb .sep { color: var(--fg-dim); margin: 0 1px; }

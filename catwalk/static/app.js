@@ -138,6 +138,42 @@ function renderBreadcrumb() {
   });
 }
 
+/* The breadcrumb doubles as the free-form path input (essential when VMS is
+   absent and there are no views to pick from): segments are links, clicking
+   the empty space swaps in an editable field. Enter navigates; Esc or
+   clicking away restores the breadcrumb. */
+function editPath() {
+  const bc = $("breadcrumb");
+  if (bc.querySelector("input")) return;
+  bc.textContent = "";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = state.path;
+  input.placeholder = "/path/to/browse";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  bc.appendChild(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  const done = (commit) => {
+    if (finished) return;                     // blur fires again on removal
+    finished = true;
+    const value = input.value;
+    renderBreadcrumb();
+    if (commit && value.trim()) {
+      const p = normDir(value);
+      rebuildTree(p);
+      navigate(p);
+    }
+  };
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); done(true); }
+    else if (e.key === "Escape") done(false);
+  };
+  input.onblur = () => done(false);
+}
+
 function showBanner(msg) {
   $("banner").textContent = msg;
   $("banner").classList.remove("hidden");
@@ -605,7 +641,6 @@ async function navigate(path) {
   $("name-filter").value = "";
   resetListing();
   hideBanner();
-  $("path-input").value = state.path;
   renderBreadcrumb();
   // Tear down the previous directory's async work before the first await:
   // a surviving rollup poll would repaint the panels this transition owns.
@@ -656,11 +691,8 @@ function init() {
     }
   };
 
-  $("path-form").onsubmit = (e) => {
-    e.preventDefault();
-    const p = normDir($("path-input").value);
-    rebuildTree(p);
-    navigate(p);
+  $("breadcrumb").onclick = (e) => {
+    if (e.target.tagName !== "A" && e.target.tagName !== "INPUT") editPath();
   };
 
   $("prev-page").onclick = () => {
