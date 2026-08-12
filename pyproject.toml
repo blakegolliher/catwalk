@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-catwalk = "catwalk.config:main"
+catwalk = "catwalk.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["catwalk*"]

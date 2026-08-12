@@ -47,15 +47,15 @@ def _parse_proc_tcp(text: str, family: int) -> list[tuple]:
     return rows
 
 
-def _own_socket_inodes() -> set[int]:
+def _own_socket_inodes(pid: int | str = "self") -> set[int]:
     inodes = set()
     try:
-        fds = os.listdir("/proc/self/fd")
+        fds = os.listdir(f"/proc/{pid}/fd")
     except OSError:
         return inodes
     for fd in fds:
         try:
-            target = os.readlink(f"/proc/self/fd/{fd}")
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
         except OSError:
             continue
         if target.startswith("socket:["):
@@ -63,8 +63,12 @@ def _own_socket_inodes() -> set[int]:
     return inodes
 
 
-def listening_sockets() -> list[tuple]:
-    """(family, addr, port) for every TCP socket this process LISTENs on."""
+def listening_sockets(pid: int | str = "self") -> list[tuple]:
+    """(family, addr, port) for every TCP socket the process LISTENs on.
+
+    Defaults to this process; `catwalk start` passes the spawned server's pid
+    (readable because it is our own child) to discover the bound port.
+    """
     rows = []
     for path, fam in (("/proc/net/tcp", socket.AF_INET), ("/proc/net/tcp6", socket.AF_INET6)):
         try:
@@ -72,7 +76,7 @@ def listening_sockets() -> list[tuple]:
                 rows += _parse_proc_tcp(f.read(), fam)
         except OSError:
             pass
-    own = _own_socket_inodes()
+    own = _own_socket_inodes(pid)
     return sorted({(fam, addr, port) for fam, addr, port, inode in rows if inode in own})
 
 
